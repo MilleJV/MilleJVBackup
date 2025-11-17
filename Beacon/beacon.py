@@ -635,14 +635,15 @@ class BeaconProbe:
         # --- SAFETY FIX: Delta Specific Start Position ---
         cur_kin_z = self.toolhead.get_position()[2]
         
-        # Check kinematics class name directly
+        # Robust check for Delta Kinematics using class name
+        # This avoids the AttributeError on config access
         is_delta = self.kinematics.__class__.__name__ == 'DeltaKinematics'
 
         if is_delta:
             kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
             max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
             
-            # Safe height: Target + Overrun + 5mm buffer (approx 8mm)
+            # Safe height: Target + Overrun + 5mm buffer
             safe_start_z = target_z_dist + overrun + 5.0
 
             # If we are too high (near home) or just above the safety buffer:
