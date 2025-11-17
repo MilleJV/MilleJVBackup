@@ -284,7 +284,7 @@ class BeaconProbe:
             self.cmd_BEACON_AUTO_CALIBRATE,
             desc=self.cmd_BEACON_AUTO_CALIBRATE_help,
         )
-        sensor_id.register_command(
+       sensor_id.register_command(
             "BEACON_OFFSET_COMPARE",
             self.cmd_BEACON_OFFSET_COMPARE,
             desc=self.cmd_BEACON_OFFSET_COMPARE_help,
@@ -292,56 +292,43 @@ class BeaconProbe:
         
         # Hook into other probing G-Codes if this is the default probe
         if sensor_id.is_unnamed():
-            # Get kinematics to check for delta compatibility
-            toolhead = self.printer.lookup_object("toolhead", None)
-            if toolhead is None:
-                # Toolhead isn't loaded yet, so defer this check
-                self.printer.register_event_handler(
-                    "klippy:connect", self._hook_gcode_commands_on_connect
-                )
-            else:
-                # Toolhead is loaded, we can check immediately
-                self._hook_gcode_commands(config, toolhead.get_kinematics())
+            # Determine kinematics from config (similar to BeaconMeshHelper)
+            # If print_radius is present, we treat it as a Delta
+            printer_config = config.getsection("printer")
+            print_radius = printer_config.getfloat("print_radius", None, above=0.0)
+            is_delta = print_radius is not None
+            
+            self._hook_gcode_commands(config, is_delta)
 
-def _hook_gcode_commands(self, config, kinematics):
+def _hook_gcode_commands(self, config, is_delta):
         """
-        Checks configuration for mesh_radius and registers hooks ONLY for
+        Checks printer kinematics and registers hooks ONLY for
         compatible modules.
         """
-        # Use the main configfile object to ensure we can check sections globally
-        # This fixes potential issues if 'config' passed in is just a section wrapper
-        pconfig = self.printer.lookup_object('configfile')
-        
-        is_round_bed = False
-        if pconfig.has_section("bed_mesh"):
-            # Check if mesh_radius is defined in [bed_mesh]
-            if pconfig.getsection("bed_mesh").getfloat("mesh_radius", None) is not None:
-                is_round_bed = True
-
-        if is_round_bed:
-            # --- Delta/Round Bed Checks ---
+        if is_delta:
+            # --- Delta-Specific Checks ---
             # Throw errors if user enables incompatible modules
-            if pconfig.has_section("z_tilt"):
+            if config.has_section("z_tilt"):
                 raise config.error(
-                    "beacon.py: [z_tilt] is not compatible with round bed/delta setups."
+                    "beacon.py: [z_tilt] is not compatible with delta kinematics."
                 )
-            if pconfig.has_section("quad_gantry_level"):
+            if config.has_section("quad_gantry_level"):
                 raise config.error(
-                    "beacon.py: [quad_gantry_level] is not compatible with round bed/delta setups."
+                    "beacon.py: [quad_gantry_level] is not compatible with delta kinematics."
                 )
-            if pconfig.has_section("screws_tilt_adjust"):
+            if config.has_section("screws_tilt_adjust"):
                 raise config.error(
-                    "beacon.py: [screws_tilt_adjust] is not compatible with round bed/delta setups."
+                    "beacon.py: [screws_tilt_adjust] is not compatible with delta kinematics."
                 )
 
             # This one IS compatible
-            self._hook_probing_gcode(pconfig, "delta_calibrate", "DELTA_CALIBRATE")
+            self._hook_probing_gcode(config, "delta_calibrate", "DELTA_CALIBRATE")
 
         else:
             # --- Cartesian/CoreXY Checks ---
-            self._hook_probing_gcode(pconfig, "z_tilt", "Z_TILT_ADJUST")
-            self._hook_probing_gcode(pconfig, "quad_gantry_level", "QUAD_GANTRY_LEVEL")
-            self._hook_probing_gcode(pconfig, "screws_tilt_adjust", "SCREWS_TILT_ADJUST")
+            self._hook_probing_gcode(config, "z_tilt", "Z_TILT_ADJUST")
+            self._hook_probing_gcode(config, "quad_gantry_level", "QUAD_GANTRY_LEVEL")
+            self._hook_probing_gcode(config, "screws_tilt_adjust", "SCREWS_TILT_ADJUST")
 
     def _hook_probing_gcode(self, config, module, cmd):
         """
