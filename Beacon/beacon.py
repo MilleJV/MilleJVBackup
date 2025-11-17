@@ -1710,7 +1710,8 @@ def _hook_probing_gcode(self, config, module, cmd):
             ).lower()
             return original_handler(gcmd)
 
-        # CRITICAL: This line must align with the 'def' above (8 spaces indent)
+        # THIS LINE MUST HAVE EXACTLY 8 SPACES OF INDENTATION
+        # It must align vertically with the 'd' in 'def hooked_cmd_callback' above.
         self.gcode.register_command(cmd, hooked_cmd_callback)
 
     # --- Webhook Handlers ---
