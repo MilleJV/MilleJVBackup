@@ -632,24 +632,28 @@ class BeaconProbe:
         # Distance to stop before target to enable stream
         approach_buffer = 0.5 
 
-        # --- SAFETY FIX: Move to safe start position ---
+        # --- SAFETY FIX: Delta Specific Start Position ---
         cur_kin_z = self.toolhead.get_position()[2]
-        kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
-        # Fallback to 300 if not found, but Delta usually reports axis_maximum
-        max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
         
-        # Safe height: Target + Overrun + 5mm buffer
-        safe_start_z = target_z_dist + overrun + 5.0
+        # Only apply this automatic move for Delta printers
+        if self.kinematics.get_name() == 'delta':
+            kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
+            max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
+            
+            # Safe height: Target + Overrun + 5mm buffer
+            safe_start_z = target_z_dist + overrun + 5.0
 
-        # If we are too high or close to the bed, move to safe height first
-        if cur_kin_z + overrun > max_z or cur_kin_z > safe_start_z:
-            gcmd.respond_info(f"Position unsafe. Moving to safe Z: {safe_start_z:.2f}mm")
-            self.toolhead.manual_move([None, None, safe_start_z], speed)
-            self.toolhead.wait_moves()
-            cur_kin_z = safe_start_z
+            # If we are too high (near home) or just above the safety buffer:
+            # Move down to the safe height first to prevent "Move out of range"
+            if cur_kin_z + overrun > max_z or cur_kin_z > safe_start_z:
+                gcmd.respond_info(f"Delta Kinematics detected. Moving to safe Z: {safe_start_z:.2f}mm")
+                self.toolhead.manual_move([None, None, safe_start_z], speed)
+                self.toolhead.wait_moves()
+                cur_kin_z = safe_start_z
         # -----------------------------------------------
 
         # Perform the initial backlash clearing move (UP)
+        # We do this blindly (no stream) to be safe
         self.toolhead.manual_move([None, None, cur_kin_z + overrun], speed)
         
         # Probe once to establish a baseline target
