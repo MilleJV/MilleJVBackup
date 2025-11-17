@@ -103,8 +103,8 @@ class BeaconProbe:
         # Check for 'print_radius' in [printer] config to detect Delta
         # We store this in 'self' so all commands can check it safely later.
         printer_config = config.getsection("printer")
-        print_radius = printer_config.getfloat("print_radius", None, above=0.0)
-        self.is_delta = print_radius is not None
+        self.print_radius = printer_config.getfloat("print_radius", None, above=0.0)
+        self.is_delta = self.print_radius is not None
         # -----------------------------------------
 
         self.speed = config.getfloat("speed", 5.0, above=0.0)
@@ -655,9 +655,9 @@ class BeaconProbe:
         # -----------------------------------------------
 
         # Perform the initial backlash clearing move (UP)
+        # We do this blindly (no stream) to save CPU
         self.toolhead.manual_move([None, None, cur_kin_z + overrun], speed)
         
-        # ... (rest of the function remains exactly the same)
         # Probe once to establish a baseline target
         self.run_probe(gcmd) 
 
@@ -688,6 +688,7 @@ class BeaconProbe:
                 self.toolhead.wait_moves()
 
                 # 3. Enable Stream for final approach
+                # Latency 50 reduces CPU load significantly vs default (0/1)
                 self.beacon.request_stream_latency(50) 
                 self._start_streaming()
                 
