@@ -635,23 +635,14 @@ class BeaconProbe:
         # --- SAFETY FIX: Delta Specific Start Position ---
         cur_kin_z = self.toolhead.get_position()[2]
         
-        # Detect Delta kinematics by checking for 'print_radius' in config
-        configfile = self.printer.lookup_object('configfile')
-        # Safe way to check for printer config section without crashing
-        is_delta = False
-        try:
-            if configfile.has_section('printer'):
-                printer_cfg = configfile.getsection('printer')
-                if printer_cfg.getfloat('print_radius', None) is not None:
-                    is_delta = True
-        except Exception:
-            pass # Fallback if config structure is unexpected
+        # Check kinematics class name directly
+        is_delta = self.kinematics.__class__.__name__ == 'DeltaKinematics'
 
         if is_delta:
             kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
             max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
             
-            # Safe height: Target + Overrun + 5mm buffer
+            # Safe height: Target + Overrun + 5mm buffer (approx 8mm)
             safe_start_z = target_z_dist + overrun + 5.0
 
             # If we are too high (near home) or just above the safety buffer:
