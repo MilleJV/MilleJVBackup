@@ -637,8 +637,15 @@ class BeaconProbe:
         
         # Detect Delta kinematics by checking for 'print_radius' in config
         configfile = self.printer.lookup_object('configfile')
-        printer_cfg = configfile.config.get('printer', {})
-        is_delta = 'print_radius' in printer_cfg
+        # Safe way to check for printer config section without crashing
+        is_delta = False
+        try:
+            if configfile.has_section('printer'):
+                printer_cfg = configfile.getsection('printer')
+                if printer_cfg.getfloat('print_radius', None) is not None:
+                    is_delta = True
+        except Exception:
+            pass # Fallback if config structure is unexpected
 
         if is_delta:
             kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
