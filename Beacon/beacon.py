@@ -621,55 +621,91 @@ class BeaconProbe:
 
     cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
-        # Get to correct Z height
+        # Get parameters
         overrun = gcmd.get_float("OVERRUN", 1.0)
         speed = gcmd.get_float("PROBE_SPEED", self.speed, above=0.0)
-        cur_z = self.toolhead.get_position()[2]
-        self.toolhead.manual_move([None, None, cur_z + overrun], speed)
-        self.run_probe(gcmd) # Probe once to establish a baseline
-
         lift_speed = self.get_lift_speed(gcmd)
         target_z_dist = gcmd.get_float("Z", self.trigger_distance)
-
         num_samples = gcmd.get_int("SAMPLES", 20)
         settle_time = self.z_settling_time
+        
+        # Distance to stop before target to enable stream
+        approach_buffer = 0.5 
+
+        # --- SAFETY FIX: Move to safe start position ---
+        cur_kin_z = self.toolhead.get_position()[2]
+        kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
+        # Fallback to 300 if not found, but Delta usually reports axis_maximum
+        max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
+        
+        # Safe height: Target + Overrun + 5mm buffer
+        safe_start_z = target_z_dist + overrun + 5.0
+
+        # If we are too high or close to the bed, move to safe height first
+        if cur_kin_z + overrun > max_z or cur_kin_z > safe_start_z:
+            gcmd.respond_info(f"Position unsafe. Moving to safe Z: {safe_start_z:.2f}mm")
+            self.toolhead.manual_move([None, None, safe_start_z], speed)
+            self.toolhead.wait_moves()
+            cur_kin_z = safe_start_z
+        # -----------------------------------------------
+
+        # Perform the initial backlash clearing move (UP)
+        self.toolhead.manual_move([None, None, cur_kin_z + overrun], speed)
+        
+        # Probe once to establish a baseline target
+        self.run_probe(gcmd) 
 
         samples_up = []
         samples_down = []
-        next_dir = -1 # Start by moving up
+        next_dir = -1 
+        
+        # Calculate the Machine Z target based on the probe we just did
+        (current_dist, _samples) = self._sample(settle_time, 10)
+        current_pos = self.toolhead.get_position()
+        missing_dist = target_z_dist - current_dist
+        target_kin_z = current_pos[2] + missing_dist
+        
+        gcmd.respond_info(f"Target kinematic Z is {target_kin_z:.3f}")
+        if target_kin_z - overrun < 0:
+            raise gcmd.error("Target minus overrun must exceed 0mm")
 
         try:
-            self._start_streaming()
-
-            (current_dist, _samples) = self._sample(settle_time, 10)
-            current_pos = self.toolhead.get_position()
-            missing_dist = target_z_dist - current_dist
-            target_kin_z = current_pos[2] + missing_dist
-            gcmd.respond_info(f"Target kinematic Z is {target_kin_z:.3f}")
-
-            if target_kin_z - overrun < 0:
-                raise gcmd.error("Target minus overrun must exceed 0mm")
-
             while len(samples_up) + len(samples_down) < num_samples:
-                # Move up/down by overrun amount
-                lift_pos = [None, None, target_kin_z + overrun * next_dir]
-                self.toolhead.manual_move(lift_pos, lift_speed)
-                # Move back to target
-                lift_pos = [None, None, target_kin_z]
-                self.toolhead.manual_move(lift_pos, lift_speed)
+                
+                # 1. Move to the "Overrun" position (Far away) - STREAM OFF
+                start_pos_z = target_kin_z + (overrun * next_dir * -1)
+                self.toolhead.manual_move([None, None, start_pos_z], lift_speed)
+                
+                # 2. Move to the "Approach" position - STREAM OFF
+                approach_start_z = target_kin_z + (approach_buffer * next_dir * -1)
+                self.toolhead.manual_move([None, None, approach_start_z], lift_speed)
+                self.toolhead.wait_moves()
+
+                # 3. Enable Stream for final approach
+                self.beacon.request_stream_latency(50) 
+                self._start_streaming()
+                
+                # 4. Final Approach Move (0.5mm) - Engaging backlash
+                self.toolhead.manual_move([None, None, target_kin_z], lift_speed)
                 self.toolhead.wait_moves()
                 
+                # 5. Measure
                 (dist, _samples) = self._sample(settle_time, 10)
+                
+                # 6. Disable Stream
+                self._stop_streaming()
+                self.beacon.drop_stream_latency_request(50)
                 
                 if next_dir == -1:
                     samples_up.append(dist)
                 else:
                     samples_down.append(dist)
                     
-                next_dir *= -1 # Reverse direction
+                next_dir *= -1
 
         finally:
             self._stop_streaming()
+            self.beacon.drop_stream_latency_request(50)
 
         res_up = median(samples_up)
         res_down = median(samples_down)
@@ -2570,11 +2606,7 @@ class BeaconEndstopWrapper:
 
         self.is_homing = True
         self.beacon._apply_threshold()
-        
-        # CRITICAL FIX: Explicitly start streaming and keep it running
-        # This prevents the stream from closing when _sample_async finishes
-        self.beacon._start_streaming()
-        self.beacon._sample_async() 
+        self.beacon._sample_async() # Safe: Takes 1 sample then stops stream
 
         self.endstop_manager.trsync_start(print_time)
 
@@ -2591,13 +2623,9 @@ class BeaconEndstopWrapper:
     def home_wait(self, home_end_time):
         stop_reason = self.endstop_manager.trsync_stop(home_end_time)
         self.beacon.beacon_stop_home_cmd.send()
-        
-        # CRITICAL FIX: Stop the streaming we started in home_start
-        self.beacon._stop_streaming()
-        
         if stop_reason is not None:
             return stop_reason
-        return home_end_time # Return end time if trigger occurred
+        return home_end_time
 
     def query_endstop(self, print_time):
         if self.beacon.model is None:
@@ -2656,10 +2684,7 @@ class BeaconContactEndstopWrapper:
                 )
 
         self.is_homing = True
-        # CRITICAL FIX: Explicitly start streaming
-        self.beacon._start_streaming()
-        self.beacon._sample_async() 
-        
+        self.beacon._sample_async() # Safe: Takes 1 sample then stops stream
         self.endstop_manager.trsync_start(print_time)
         
         primary_trsync = self.endstop_manager.trsync_mcus[0]
@@ -2686,7 +2711,7 @@ class BeaconContactEndstopWrapper:
         try:
             stop_reason = self.endstop_manager.trsync_stop(home_end_time)
             if stop_reason is not None:
-                return stop_reason # Did not trigger
+                return stop_reason 
                 
             if self.beacon._mcu.is_fileoutput():
                 return home_end_time
@@ -2725,11 +2750,9 @@ class BeaconContactEndstopWrapper:
                         raise self.printer.command_error(
                             "Contact triggered while accelerating"
                         )
-                    return trigger_time # Success
+                    return trigger_time 
         finally:
             self.beacon.beacon_contact_stop_home_cmd.send()
-            # CRITICAL FIX: Stop streaming
-            self.beacon._stop_streaming()
 
     def query_endstop(self, print_time):
         return 0 # Contact endstop doesn't support query
