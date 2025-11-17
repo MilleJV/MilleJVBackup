@@ -2570,7 +2570,11 @@ class BeaconEndstopWrapper:
 
         self.is_homing = True
         self.beacon._apply_threshold()
-        self.beacon._sample_async() # Start sampling
+        
+        # CRITICAL FIX: Explicitly start streaming and keep it running
+        # This prevents the stream from closing when _sample_async finishes
+        self.beacon._start_streaming()
+        self.beacon._sample_async() 
 
         self.endstop_manager.trsync_start(print_time)
 
@@ -2587,6 +2591,10 @@ class BeaconEndstopWrapper:
     def home_wait(self, home_end_time):
         stop_reason = self.endstop_manager.trsync_stop(home_end_time)
         self.beacon.beacon_stop_home_cmd.send()
+        
+        # CRITICAL FIX: Stop the streaming we started in home_start
+        self.beacon._stop_streaming()
+        
         if stop_reason is not None:
             return stop_reason
         return home_end_time # Return end time if trigger occurred
@@ -2648,7 +2656,10 @@ class BeaconContactEndstopWrapper:
                 )
 
         self.is_homing = True
-        self.beacon._sample_async() # Start background sampling
+        # CRITICAL FIX: Explicitly start streaming
+        self.beacon._start_streaming()
+        self.beacon._sample_async() 
+        
         self.endstop_manager.trsync_start(print_time)
         
         primary_trsync = self.endstop_manager.trsync_mcus[0]
@@ -2717,6 +2728,8 @@ class BeaconContactEndstopWrapper:
                     return trigger_time # Success
         finally:
             self.beacon.beacon_contact_stop_home_cmd.send()
+            # CRITICAL FIX: Stop streaming
+            self.beacon._stop_streaming()
 
     def query_endstop(self, print_time):
         return 0 # Contact endstop doesn't support query
