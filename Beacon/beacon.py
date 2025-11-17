@@ -289,16 +289,17 @@ class BeaconProbe:
             self.cmd_BEACON_OFFSET_COMPARE,
             desc=self.cmd_BEACON_OFFSET_COMPARE_help,
         )
+
+        # --- ONE-TIME SETUP: Detect Kinematics ---
+        # We store this in 'self' so all commands can check it safely later.
+        # If 'print_radius' exists in [printer], it is a Delta.
+        printer_config = config.getsection("printer")
+        print_radius = printer_config.getfloat("print_radius", None, above=0.0)
+        self.is_delta = print_radius is not None
         
         # Hook into other probing G-Codes if this is the default probe
         if sensor_id.is_unnamed():
-            # Determine kinematics from config (similar to BeaconMeshHelper)
-            # If print_radius is present, we treat it as a Delta
-            printer_config = config.getsection("printer")
-            print_radius = printer_config.getfloat("print_radius", None, above=0.0)
-            is_delta = print_radius is not None
-            
-            self._hook_gcode_commands(config, is_delta)
+            self._hook_gcode_commands(config, self.is_delta)
 
     def _hook_gcode_commands(self, config, is_delta):
         """
@@ -635,12 +636,10 @@ class BeaconProbe:
         # --- SAFETY FIX: Delta Specific Start Position ---
         cur_kin_z = self.toolhead.get_position()[2]
         
-        # Robust check for Delta Kinematics using class name
-        # This avoids the AttributeError on config access
-        is_delta = self.kinematics.__class__.__name__ == 'DeltaKinematics'
-
-        if is_delta:
+        # Use the class variable we set in __init__
+        if self.is_delta:
             kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
+            # Fallback to 300 if axis_maximum is somehow missing
             max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
             
             # Safe height: Target + Overrun + 5mm buffer
@@ -688,6 +687,7 @@ class BeaconProbe:
                 self.toolhead.wait_moves()
 
                 # 3. Enable Stream for final approach
+                # Latency 50 reduces CPU load significantly vs default (0/1)
                 self.beacon.request_stream_latency(50) 
                 self._start_streaming()
                 
@@ -875,7 +875,8 @@ class BeaconProbe:
                     )
                     f.write(log_line)
 
-                with self.streaming_session(_poke_stream_callback):
+                # OPTIMIZATION: latency=100 drastically reduces CPU interrupts
+                with self.streaming_session(_poke_stream_callback, latency=100):
                     self._sample_async()
                     self.toolhead.get_last_move_time()
                     pos = self.toolhead.get_position()
