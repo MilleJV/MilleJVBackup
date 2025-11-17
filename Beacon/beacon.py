@@ -635,8 +635,12 @@ class BeaconProbe:
         # --- SAFETY FIX: Delta Specific Start Position ---
         cur_kin_z = self.toolhead.get_position()[2]
         
-        # Only apply this automatic move for Delta printers
-        if self.kinematics.get_name() == 'delta':
+        # Detect Delta kinematics by checking for 'print_radius' in config
+        configfile = self.printer.lookup_object('configfile')
+        printer_cfg = configfile.config.get('printer', {})
+        is_delta = 'print_radius' in printer_cfg
+
+        if is_delta:
             kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
             max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
             
@@ -644,7 +648,6 @@ class BeaconProbe:
             safe_start_z = target_z_dist + overrun + 5.0
 
             # If we are too high (near home) or just above the safety buffer:
-            # Move down to the safe height first to prevent "Move out of range"
             if cur_kin_z + overrun > max_z or cur_kin_z > safe_start_z:
                 gcmd.respond_info(f"Delta Kinematics detected. Moving to safe Z: {safe_start_z:.2f}mm")
                 self.toolhead.manual_move([None, None, safe_start_z], speed)
@@ -653,7 +656,7 @@ class BeaconProbe:
         # -----------------------------------------------
 
         # Perform the initial backlash clearing move (UP)
-        # We do this blindly (no stream) to be safe
+        # We do this blindly (no stream) to save CPU
         self.toolhead.manual_move([None, None, cur_kin_z + overrun], speed)
         
         # Probe once to establish a baseline target
