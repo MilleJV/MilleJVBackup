@@ -499,7 +499,7 @@ class BeaconProbe:
                 )
             except msgproto.error:
                 pass # Ignore if command doesn't exist
-
+            
             constants = self._mcu.get_constants()
             self._mcu_freq = self._mcu.get_constant_float("CLOCK_FREQ")
 
