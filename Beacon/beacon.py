@@ -284,7 +284,7 @@ class BeaconProbe:
             self.cmd_BEACON_AUTO_CALIBRATE,
             desc=self.cmd_BEACON_AUTO_CALIBRATE_help,
         )
-       sensor_id.register_command(
+        sensor_id.register_command(
             "BEACON_OFFSET_COMPARE",
             self.cmd_BEACON_OFFSET_COMPARE,
             desc=self.cmd_BEACON_OFFSET_COMPARE_help,
@@ -300,7 +300,7 @@ class BeaconProbe:
             
             self._hook_gcode_commands(config, is_delta)
 
-def _hook_gcode_commands(self, config, is_delta):
+    def _hook_gcode_commands(self, config, is_delta):
         """
         Checks printer kinematics and registers hooks ONLY for
         compatible modules.
