@@ -100,7 +100,7 @@ class BeaconProbe:
         self.gcode = printer.lookup_object("gcode")
 
         # --- ONE-TIME SETUP: Detect Kinematics ---
-        # Check for 'print_radius' in [printer] config to detect Delta
+        # Check for 'print_radius' in [printer] config to detect Delta.
         # We store this in 'self' so all commands can check it safely later.
         printer_config = config.getsection("printer")
         self.print_radius = printer_config.getfloat("print_radius", None, above=0.0)
@@ -299,8 +299,8 @@ class BeaconProbe:
         )
         
         # Hook into other probing G-Codes if this is the default probe
-        # Uses the 'self.is_delta' flag we detected earlier
         if sensor_id.is_unnamed():
+            # Check self.is_delta which we set earlier in this function
             self._hook_gcode_commands(config)
 
     def _hook_gcode_commands(self, config):
@@ -308,9 +308,9 @@ class BeaconProbe:
         Checks printer kinematics and registers hooks ONLY for
         compatible modules.
         """
+        # Use the class attribute we set in __init__
         if self.is_delta:
             # --- Delta-Specific Checks ---
-            # Throw errors if user enables incompatible modules
             if config.has_section("z_tilt"):
                 raise config.error(
                     "beacon.py: [z_tilt] is not compatible with delta kinematics."
@@ -632,40 +632,38 @@ class BeaconProbe:
         num_samples = gcmd.get_int("SAMPLES", 20)
         settle_time = self.z_settling_time
         
-        # Distance to stop before target to enable stream
-        approach_buffer = 0.5 
+        # 1. Define "Creep" parameters for the final approach
+        approach_buffer = 0.5       # Start streaming 0.5mm away
+        creep_speed = 3.0           # User requested slow speed (mm/s)
+        dwell_time = 0.5            # Dwell before measuring
 
         # --- SAFETY FIX: Delta Specific Start Position ---
         cur_kin_z = self.toolhead.get_position()[2]
         
-        # REFACTOR: Use the robust self.is_delta flag
+        # Use self.is_delta (Safe Check)
         if self.is_delta:
             kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
             max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
             
-            # Safe height: Target + Overrun + 5mm buffer
             safe_start_z = target_z_dist + overrun + 5.0
 
-            # If we are too high (near home) or just above the safety buffer:
+            # If we are too high, move to safe height first
             if cur_kin_z + overrun > max_z or cur_kin_z > safe_start_z:
-                gcmd.respond_info(f"Delta Kinematics detected. Moving to safe Z: {safe_start_z:.2f}mm")
+                gcmd.respond_info(f"Delta detected. Moving to safe Z: {safe_start_z:.2f}mm")
                 self.toolhead.manual_move([None, None, safe_start_z], speed)
                 self.toolhead.wait_moves()
                 cur_kin_z = safe_start_z
         # -----------------------------------------------
 
-        # Perform the initial backlash clearing move (UP)
-        # We do this blindly (no stream) to save CPU
+        # Perform initial backlash clearing move (Stream OFF)
         self.toolhead.manual_move([None, None, cur_kin_z + overrun], speed)
-        
-        # Probe once to establish a baseline target
         self.run_probe(gcmd) 
 
         samples_up = []
         samples_down = []
         next_dir = -1 
         
-        # Calculate the Machine Z target based on the probe we just did
+        # Calculate the Machine Z target
         (current_dist, _samples) = self._sample(settle_time, 10)
         current_pos = self.toolhead.get_position()
         missing_dist = target_z_dist - current_dist
@@ -678,28 +676,33 @@ class BeaconProbe:
         try:
             while len(samples_up) + len(samples_down) < num_samples:
                 
-                # 1. Move to the "Overrun" position (Far away) - STREAM OFF
+                # 1. Move to the "Overrun" position (Far away)
+                # STREAM IS OFF to save CPU
                 start_pos_z = target_kin_z + (overrun * next_dir * -1)
                 self.toolhead.manual_move([None, None, start_pos_z], lift_speed)
                 
-                # 2. Move to the "Approach" position - STREAM OFF
+                # 2. Move to "Approach" start (0.5mm away)
+                # STREAM IS OFF
                 approach_start_z = target_kin_z + (approach_buffer * next_dir * -1)
                 self.toolhead.manual_move([None, None, approach_start_z], lift_speed)
                 self.toolhead.wait_moves()
 
-                # 3. Enable Stream for final approach
-                # Latency 50 reduces CPU load significantly vs default (0/1)
+                # 3. Enable Stream for final creep
+                # Latency 50ms is safe for Delta
                 self.beacon.request_stream_latency(50) 
                 self._start_streaming()
                 
-                # 4. Final Approach Move (0.5mm) - Engaging backlash
-                self.toolhead.manual_move([None, None, target_kin_z], lift_speed)
+                # 4. Final Creep Move (2-5mm/s)
+                self.toolhead.manual_move([None, None, target_kin_z], creep_speed)
                 self.toolhead.wait_moves()
                 
-                # 5. Measure
+                # 5. Dwell before measuring
+                self.toolhead.dwell(dwell_time)
+                
+                # 6. Measure
                 (dist, _samples) = self._sample(settle_time, 10)
                 
-                # 6. Disable Stream
+                # 7. Disable Stream immediately
                 self._stop_streaming()
                 self.beacon.drop_stream_latency_request(50)
                 
@@ -708,7 +711,7 @@ class BeaconProbe:
                 else:
                     samples_down.append(dist)
                     
-                next_dir *= -1
+                next_dir *= -1 # Flip direction
 
         finally:
             self._stop_streaming()
@@ -2609,31 +2612,92 @@ class BeaconEndstopWrapper:
     def home_start(
         self, print_time, sample_time, sample_count, rest_time, triggered=True
     ):
-        if self.beacon.model is None:
-            raise self.printer.command_error("No Beacon model loaded")
+        extruder = self.beacon.toolhead.get_extruder()
+        if extruder is not None:
+            curtime = self.beacon.reactor.monotonic()
+            cur_temp = extruder.get_heater().get_status(curtime)["temperature"]
+            if cur_temp >= self.max_hotend_temp:
+                raise self.printer.command_error(
+                    f"Current hotend temperature {cur_temp:.1f} exceeds maximum allowed temperature {self.max_hotend_temp:.1f}"
+                )
 
         self.is_homing = True
-        self.beacon._apply_threshold()
-        self.beacon._sample_async() # Safe: Takes 1 sample then stops stream
-
+        
+        # CRITICAL FIX: Use latency=50 to prevent Delta CPU overload
+        self.beacon.request_stream_latency(50)
+        self.beacon._start_streaming()
+        # REMOVED: self.beacon._sample_async() <- This was forcing latency=1
+        
         self.endstop_manager.trsync_start(print_time)
-
+        
         primary_trsync = self.endstop_manager.trsync_mcus[0]
-        self.beacon.beacon_home_cmd.send(
+        
+        if self.beacon.beacon_contact_set_latency_min_cmd is not None:
+            self.beacon.beacon_contact_set_latency_min_cmd.send(
+                [self.beacon.contact_latency_min]
+            )
+        if self.beacon.beacon_contact_set_sensitivity_cmd is not None:
+            self.beacon.beacon_contact_set_sensitivity_cmd.send(
+                [self.beacon.contact_sensitivity]
+            )
+            
+        self.beacon.beacon_contact_home_cmd.send(
             [
                 primary_trsync.get_oid(),
                 primary_trsync.REASON_ENDSTOP_HIT,
-                0, # trigger_invert
+                0, # trigger_type (0 = Z)
             ]
         )
         return self.endstop_manager.trigger_completion
 
     def home_wait(self, home_end_time):
-        stop_reason = self.endstop_manager.trsync_stop(home_end_time)
-        self.beacon.beacon_stop_home_cmd.send()
-        if stop_reason is not None:
-            return stop_reason
-        return home_end_time
+        try:
+            stop_reason = self.endstop_manager.trsync_stop(home_end_time)
+            if stop_reason is not None:
+                return stop_reason 
+                
+            if self.beacon._mcu.is_fileoutput():
+                return home_end_time
+                
+            self.beacon.toolhead.wait_moves()
+            
+            # Poll for the exact contact time
+            deadline = self.beacon.reactor.monotonic() + 0.5
+            while True:
+                response = self.beacon.beacon_contact_query_cmd.send([])
+                if response["triggered"] == 0:
+                    now = self.beacon.reactor.monotonic()
+                    if now >= deadline:
+                        raise self.printer.command_error(
+                            "Timeout getting contact time"
+                        )
+                    self.beacon.reactor.pause(now + 0.001)
+                    continue
+                    
+                trigger_time = self.beacon._clock32_to_time(response["detect_clock"])
+                
+                ffi_main, ffi_lib = chelper.get_ffi()
+                move_data = ffi_main.new("struct pull_move[1]")
+                count = ffi_lib.trapq_extract_old(self.beacon.trapq, move_data, 1, 0.0, trigger_time)
+                
+                if trigger_time >= home_end_time:
+                    return 0.0
+                if count:
+                    accel = move_data[0].accel
+                    if accel < 0:
+                        logging.info("Contact triggered while decelerating")
+                        raise self.printer.command_error(
+                            "No trigger on probe after full movement"
+                        )
+                    elif accel > 0:
+                        raise self.printer.command_error(
+                            "Contact triggered while accelerating"
+                        )
+                    return trigger_time 
+        finally:
+            self.beacon.beacon_contact_stop_home_cmd.send()
+            # CRITICAL FIX: Clean up the latency request
+            self.beacon.drop_stream_latency_request(50)
 
     def query_endstop(self, print_time):
         if self.beacon.model is None:
