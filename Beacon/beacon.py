@@ -1682,19 +1682,6 @@ class BeaconProbe:
             "model": model_name,
         }
 
-def get_status(self, eventtime):
-        model_name = self.model.name if self.model is not None else None
-        return {
-            "last_sample": self.last_sample,
-            "last_received_sample": self.last_received_sample,
-            "last_z_result": self.last_z_result,
-            "last_probe_position": self.last_probe_position,
-            "last_probe_result": self.last_probe_result,
-            "last_offset_result": self.last_offset_result,
-            "last_poke_result": self.last_poke_result,
-            "model": model_name,
-        }
-
     def _hook_probing_gcode(self, config, module, cmd):
         """
         Hooks into other Klipper modules that perform probing (e.g., Z_TILT)
