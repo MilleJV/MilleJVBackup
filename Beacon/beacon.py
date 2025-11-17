@@ -291,22 +291,25 @@ class BeaconProbe:
         )
 
         # --- ONE-TIME SETUP: Detect Kinematics ---
-        # We store this in 'self' so all commands can check it safely later.
-        # If 'print_radius' exists in [printer], it is a Delta.
+        # Check for 'print_radius' in [printer] config to detect Delta
         printer_config = config.getsection("printer")
         print_radius = printer_config.getfloat("print_radius", None, above=0.0)
+        
+        # Store as a class attribute so it can be used everywhere
         self.is_delta = print_radius is not None
         
         # Hook into other probing G-Codes if this is the default probe
         if sensor_id.is_unnamed():
-            self._hook_gcode_commands(config, self.is_delta)
+            # Pass 'self.is_delta' explicitly, or the function can now just use 'self.is_delta'
+            self._hook_gcode_commands(config)
 
-    def _hook_gcode_commands(self, config, is_delta):
+    def _hook_gcode_commands(self, config):
         """
         Checks printer kinematics and registers hooks ONLY for
         compatible modules.
         """
-        if is_delta:
+        # Use the class attribute we set in __init__
+        if self.is_delta:
             # --- Delta-Specific Checks ---
             # Throw errors if user enables incompatible modules
             if config.has_section("z_tilt"):
@@ -636,10 +639,9 @@ class BeaconProbe:
         # --- SAFETY FIX: Delta Specific Start Position ---
         cur_kin_z = self.toolhead.get_position()[2]
         
-        # Use the class variable we set in __init__
+        # REFACTOR: Use the robust self.is_delta flag
         if self.is_delta:
             kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
-            # Fallback to 300 if axis_maximum is somehow missing
             max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
             
             # Safe height: Target + Overrun + 5mm buffer
@@ -654,9 +656,9 @@ class BeaconProbe:
         # -----------------------------------------------
 
         # Perform the initial backlash clearing move (UP)
-        # We do this blindly (no stream) to save CPU
         self.toolhead.manual_move([None, None, cur_kin_z + overrun], speed)
         
+        # ... (rest of the function remains exactly the same)
         # Probe once to establish a baseline target
         self.run_probe(gcmd) 
 
@@ -687,7 +689,6 @@ class BeaconProbe:
                 self.toolhead.wait_moves()
 
                 # 3. Enable Stream for final approach
-                # Latency 50 reduces CPU load significantly vs default (0/1)
                 self.beacon.request_stream_latency(50) 
                 self._start_streaming()
                 
