@@ -2612,92 +2612,32 @@ class BeaconEndstopWrapper:
     def home_start(
         self, print_time, sample_time, sample_count, rest_time, triggered=True
     ):
-        extruder = self.beacon.toolhead.get_extruder()
-        if extruder is not None:
-            curtime = self.beacon.reactor.monotonic()
-            cur_temp = extruder.get_heater().get_status(curtime)["temperature"]
-            if cur_temp >= self.max_hotend_temp:
-                raise self.printer.command_error(
-                    f"Current hotend temperature {cur_temp:.1f} exceeds maximum allowed temperature {self.max_hotend_temp:.1f}"
-                )
+        # --- PROXIMITY HOMING START ---
+        if self.beacon.model is None:
+            raise self.printer.command_error("No Beacon model loaded")
 
         self.is_homing = True
-        
-        # CRITICAL FIX: Use latency=50 to prevent Delta CPU overload
-        self.beacon.request_stream_latency(50)
-        self.beacon._start_streaming()
-        # REMOVED: self.beacon._sample_async() <- This was forcing latency=1
-        
+        self.beacon._apply_threshold()
+        self.beacon._sample_async() # Wake up sensor, but don't force full stream
+
         self.endstop_manager.trsync_start(print_time)
-        
+
         primary_trsync = self.endstop_manager.trsync_mcus[0]
-        
-        if self.beacon.beacon_contact_set_latency_min_cmd is not None:
-            self.beacon.beacon_contact_set_latency_min_cmd.send(
-                [self.beacon.contact_latency_min]
-            )
-        if self.beacon.beacon_contact_set_sensitivity_cmd is not None:
-            self.beacon.beacon_contact_set_sensitivity_cmd.send(
-                [self.beacon.contact_sensitivity]
-            )
-            
-        self.beacon.beacon_contact_home_cmd.send(
+        self.beacon.beacon_home_cmd.send(
             [
                 primary_trsync.get_oid(),
                 primary_trsync.REASON_ENDSTOP_HIT,
-                0, # trigger_type (0 = Z)
+                0, # trigger_invert
             ]
         )
         return self.endstop_manager.trigger_completion
 
     def home_wait(self, home_end_time):
-        try:
-            stop_reason = self.endstop_manager.trsync_stop(home_end_time)
-            if stop_reason is not None:
-                return stop_reason 
-                
-            if self.beacon._mcu.is_fileoutput():
-                return home_end_time
-                
-            self.beacon.toolhead.wait_moves()
-            
-            # Poll for the exact contact time
-            deadline = self.beacon.reactor.monotonic() + 0.5
-            while True:
-                response = self.beacon.beacon_contact_query_cmd.send([])
-                if response["triggered"] == 0:
-                    now = self.beacon.reactor.monotonic()
-                    if now >= deadline:
-                        raise self.printer.command_error(
-                            "Timeout getting contact time"
-                        )
-                    self.beacon.reactor.pause(now + 0.001)
-                    continue
-                    
-                trigger_time = self.beacon._clock32_to_time(response["detect_clock"])
-                
-                ffi_main, ffi_lib = chelper.get_ffi()
-                move_data = ffi_main.new("struct pull_move[1]")
-                count = ffi_lib.trapq_extract_old(self.beacon.trapq, move_data, 1, 0.0, trigger_time)
-                
-                if trigger_time >= home_end_time:
-                    return 0.0
-                if count:
-                    accel = move_data[0].accel
-                    if accel < 0:
-                        logging.info("Contact triggered while decelerating")
-                        raise self.printer.command_error(
-                            "No trigger on probe after full movement"
-                        )
-                    elif accel > 0:
-                        raise self.printer.command_error(
-                            "Contact triggered while accelerating"
-                        )
-                    return trigger_time 
-        finally:
-            self.beacon.beacon_contact_stop_home_cmd.send()
-            # CRITICAL FIX: Clean up the latency request
-            self.beacon.drop_stream_latency_request(50)
+        stop_reason = self.endstop_manager.trsync_stop(home_end_time)
+        self.beacon.beacon_stop_home_cmd.send()
+        if stop_reason is not None:
+            return stop_reason
+        return home_end_time
 
     def query_endstop(self, print_time):
         if self.beacon.model is None:
@@ -2746,6 +2686,8 @@ class BeaconContactEndstopWrapper:
     def home_start(
         self, print_time, sample_time, sample_count, rest_time, triggered=True
     ):
+        # --- CONTACT HOMING START ---
+        # 1. Safety Check: Temperature
         extruder = self.beacon.toolhead.get_extruder()
         if extruder is not None:
             curtime = self.beacon.reactor.monotonic()
@@ -2756,7 +2698,13 @@ class BeaconContactEndstopWrapper:
                 )
 
         self.is_homing = True
-        self.beacon._sample_async() # Safe: Takes 1 sample then stops stream
+        
+        # 2. Start Streaming (Required for Contact)
+        # FIX: High latency prevents CPU overload on Delta
+        self.beacon.request_stream_latency(100)
+        self.beacon._start_streaming()
+        self.beacon._sample_async() 
+        
         self.endstop_manager.trsync_start(print_time)
         
         primary_trsync = self.endstop_manager.trsync_mcus[0]
@@ -2825,12 +2773,14 @@ class BeaconContactEndstopWrapper:
                     return trigger_time 
         finally:
             self.beacon.beacon_contact_stop_home_cmd.send()
+            # FIX: Drop latency request
+            self.beacon.drop_stream_latency_request(100)
 
     def query_endstop(self, print_time):
-        return 0 # Contact endstop doesn't support query
+        return 0 
 
     def get_position_endstop(self):
-        return 0 # Contact endstop triggers at 0
+        return 0
 
 
 # --- Homing Override Class ---
