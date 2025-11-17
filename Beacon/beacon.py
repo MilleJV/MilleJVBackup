@@ -1682,27 +1682,27 @@ class BeaconProbe:
             "model": model_name,
         }
 
-    def _hook_probing_gcode(self, config, module, cmd):
-        """
-        Hooks into other Klipper modules that perform probing (e.g., Z_TILT)
-        to set the correct probe method (contact/proximity).
-        """
-        if not config.has_section(module):
-            return
+        def _hook_probing_gcode(self, config, module, cmd):
+            """
+            Hooks into other Klipper modules that perform probing (e.g., Z_TILT)
+            to set the correct probe method (contact/proximity).
+            """
+            if not config.has_section(module):
+                return
 
-        try:
-            mod = self.printer.load_object(config, module)
-        except self.printer.config_error as e:
-            logging.info(f"Failed to load module {module} for hooking: {e}")
-            return
+            try:
+                mod = self.printer.load_object(config, module)
+            except self.printer.config_error as e:
+                logging.info(f"Failed to load module {module} for hooking: {e}")
+                return
 
-        if mod is None:
-            return
+            if mod is None:
+                return
 
-        original_handler = self.gcode.register_command(cmd, None)
-        if original_handler is None:
-            logging.info(f"Could not hook G-Code command {cmd}")
-            return
+            original_handler = self.gcode.register_command(cmd, None)
+            if original_handler is None:
+                logging.info(f"Could not hook G-Code command {cmd}")
+                return
 
     def hooked_cmd_callback(gcmd):
         self._current_probe = gcmd.get(
