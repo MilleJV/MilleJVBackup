@@ -358,7 +358,7 @@ class BeaconProbe:
             ).lower()
             return original_handler(gcmd)
 
-            self.gcode.register_command(cmd, hooked_cmd_callback)
+        self.gcode.register_command(cmd, hooked_cmd_callback)
 
     # --- Klipper Event Handlers ---
 
