@@ -99,6 +99,14 @@ class BeaconProbe:
         self.name = config.get_name()
         self.gcode = printer.lookup_object("gcode")
 
+        # --- ONE-TIME SETUP: Detect Kinematics ---
+        # Check for 'print_radius' in [printer] config to detect Delta
+        # We store this in 'self' so all commands can check it safely later.
+        printer_config = config.getsection("printer")
+        print_radius = printer_config.getfloat("print_radius", None, above=0.0)
+        self.is_delta = print_radius is not None
+        # -----------------------------------------
+
         self.speed = config.getfloat("speed", 5.0, above=0.0)
         self.lift_speed = config.getfloat("lift_speed", self.speed, above=0.0)
         self.backlash_comp = config.getfloat("backlash_comp", 0.5)
@@ -289,18 +297,10 @@ class BeaconProbe:
             self.cmd_BEACON_OFFSET_COMPARE,
             desc=self.cmd_BEACON_OFFSET_COMPARE_help,
         )
-
-        # --- ONE-TIME SETUP: Detect Kinematics ---
-        # Check for 'print_radius' in [printer] config to detect Delta
-        printer_config = config.getsection("printer")
-        print_radius = printer_config.getfloat("print_radius", None, above=0.0)
-        
-        # Store as a class attribute so it can be used everywhere
-        self.is_delta = print_radius is not None
         
         # Hook into other probing G-Codes if this is the default probe
+        # Uses the 'self.is_delta' flag we detected earlier
         if sensor_id.is_unnamed():
-            # Pass 'self.is_delta' explicitly, or the function can now just use 'self.is_delta'
             self._hook_gcode_commands(config)
 
     def _hook_gcode_commands(self, config):
@@ -308,7 +308,6 @@ class BeaconProbe:
         Checks printer kinematics and registers hooks ONLY for
         compatible modules.
         """
-        # Use the class attribute we set in __init__
         if self.is_delta:
             # --- Delta-Specific Checks ---
             # Throw errors if user enables incompatible modules
@@ -3031,13 +3030,11 @@ class BeaconMeshHelper:
         self.beacon = beacon
         self.scipy = None
         self.mesh_config = mesh_config
-        printer_config = self.config = config.getsection("printer")
         # Store the bed_mesh instance
         self.bed_mesh_instance = self.beacon.printer.load_object(mesh_config, "bed_mesh")
 
         self.speed = mesh_config.getfloat("speed", 50.0, above=0.0, note_valid=False)
         self.radius = mesh_config.getfloat("mesh_radius", None, above=0.0)
-        self.print_radius = printer_config.getfloat("print_radius", None, above=0.0)
         
         # Default relative_reference_index to None
         self.relative_reference_index = None
