@@ -103,8 +103,8 @@ class BeaconProbe:
         # Check for 'print_radius' in [printer] config to detect Delta.
         # We store this in 'self' so all commands can check it safely later.
         printer_config = config.getsection("printer")
-        self.print_radius = printer_config.getfloat("print_radius", None, above=0.0)
-        self.is_delta = self.print_radius is not None
+        print_radius = printer_config.getfloat("print_radius", None, above=0.0)
+        self.is_delta = print_radius is not None
         # -----------------------------------------
 
         self.speed = config.getfloat("speed", 5.0, above=0.0)
@@ -300,7 +300,6 @@ class BeaconProbe:
         
         # Hook into other probing G-Codes if this is the default probe
         if sensor_id.is_unnamed():
-            # Check self.is_delta which we set earlier in this function
             self._hook_gcode_commands(config)
 
     def _hook_gcode_commands(self, config):
@@ -632,38 +631,42 @@ class BeaconProbe:
         num_samples = gcmd.get_int("SAMPLES", 20)
         settle_time = self.z_settling_time
         
-        # 1. Define "Creep" parameters for the final approach
-        approach_buffer = 0.5       # Start streaming 0.5mm away
-        creep_speed = 3.0           # User requested slow speed (mm/s)
-        dwell_time = 0.5            # Dwell before measuring
+        # High-accuracy settings for the final approach
+        approach_buffer = 0.5 
+        approach_speed = 3.0 # Extremely slow final move for accuracy
+        approach_dwell = 0.5 # Wait for mechanics to settle
 
         # --- SAFETY FIX: Delta Specific Start Position ---
         cur_kin_z = self.toolhead.get_position()[2]
         
-        # Use self.is_delta (Safe Check)
+        # Use the robust self.is_delta flag (set in __init__)
         if self.is_delta:
             kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
             max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
             
+            # Safe height: Target + Overrun + 5mm buffer
             safe_start_z = target_z_dist + overrun + 5.0
 
-            # If we are too high, move to safe height first
+            # If we are too high (near home) or just above the safety buffer:
             if cur_kin_z + overrun > max_z or cur_kin_z > safe_start_z:
-                gcmd.respond_info(f"Delta detected. Moving to safe Z: {safe_start_z:.2f}mm")
+                gcmd.respond_info(f"Delta Kinematics detected. Moving to safe Z: {safe_start_z:.2f}mm")
                 self.toolhead.manual_move([None, None, safe_start_z], speed)
                 self.toolhead.wait_moves()
                 cur_kin_z = safe_start_z
         # -----------------------------------------------
 
-        # Perform initial backlash clearing move (Stream OFF)
+        # Perform the initial backlash clearing move (UP)
+        # We do this blindly (no stream) to save CPU
         self.toolhead.manual_move([None, None, cur_kin_z + overrun], speed)
+        
+        # Probe once to establish a baseline target
         self.run_probe(gcmd) 
 
         samples_up = []
         samples_down = []
         next_dir = -1 
         
-        # Calculate the Machine Z target
+        # Calculate the Machine Z target based on the probe we just did
         (current_dist, _samples) = self._sample(settle_time, 10)
         current_pos = self.toolhead.get_position()
         missing_dist = target_z_dist - current_dist
@@ -676,33 +679,30 @@ class BeaconProbe:
         try:
             while len(samples_up) + len(samples_down) < num_samples:
                 
-                # 1. Move to the "Overrun" position (Far away)
-                # STREAM IS OFF to save CPU
+                # 1. Move to the "Overrun" position (Far away) - STREAM OFF
+                # Faster move to get near the point
                 start_pos_z = target_kin_z + (overrun * next_dir * -1)
                 self.toolhead.manual_move([None, None, start_pos_z], lift_speed)
                 
-                # 2. Move to "Approach" start (0.5mm away)
-                # STREAM IS OFF
+                # 2. Move to the "Approach" position - STREAM OFF
+                # This puts us 0.5mm away from the target
                 approach_start_z = target_kin_z + (approach_buffer * next_dir * -1)
                 self.toolhead.manual_move([None, None, approach_start_z], lift_speed)
                 self.toolhead.wait_moves()
 
-                # 3. Enable Stream for final creep
-                # Latency 50ms is safe for Delta
+                # 3. Enable Stream for final approach
                 self.beacon.request_stream_latency(50) 
                 self._start_streaming()
                 
-                # 4. Final Creep Move (2-5mm/s)
-                self.toolhead.manual_move([None, None, target_kin_z], creep_speed)
+                # 4. Final Approach Move (0.5mm) - Super Slow & Accurate
+                self.toolhead.manual_move([None, None, target_kin_z], approach_speed)
                 self.toolhead.wait_moves()
+                self.toolhead.dwell(approach_dwell) # Wait for mechanics to settle
                 
-                # 5. Dwell before measuring
-                self.toolhead.dwell(dwell_time)
-                
-                # 6. Measure
+                # 5. Measure
                 (dist, _samples) = self._sample(settle_time, 10)
                 
-                # 7. Disable Stream immediately
+                # 6. Disable Stream immediately
                 self._stop_streaming()
                 self.beacon.drop_stream_latency_request(50)
                 
@@ -711,7 +711,7 @@ class BeaconProbe:
                 else:
                     samples_down.append(dist)
                     
-                next_dir *= -1 # Flip direction
+                next_dir *= -1
 
         finally:
             self._stop_streaming()
