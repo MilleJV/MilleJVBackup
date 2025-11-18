@@ -627,8 +627,8 @@ class BeaconProbe:
     cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
         overrun = gcmd.get_float("OVERRUN", 1.0)
-        # FIX: Default target Z closer (1.5mm) for better eddy signal
-        target_z_dist = gcmd.get_float("Z", 1.5) 
+        # FIX: Target 1.0mm for closer measurement
+        target_z_dist = gcmd.get_float("Z", 1.0)
         num_samples = gcmd.get_int("SAMPLES", 20)
         sample_count_per_read = 50
         settle_time = self.z_settling_time
@@ -651,7 +651,7 @@ class BeaconProbe:
         self.gcode.run_script_from_command("G28")
         
         # 2. Move to Safe Z
-        self.toolhead.manual_move([None, None, 10.0], fast_speed)
+        self.toolhead.manual_move([None, None, 2.0], fast_speed)
         self.toolhead.wait_moves()
         
         # 3. Move to Z_Start_test
@@ -667,14 +667,13 @@ class BeaconProbe:
         self.toolhead.dwell(1.0)
         
         (baseline_dist, _) = self._sample(settle_time, sample_count_per_read)
-        
         target_kin_z = self.toolhead.get_position()[2]
         gcmd.respond_info(f"Baseline: {baseline_dist:.5f} at Machine Z: {target_kin_z:.4f}")
 
         samples_down = []
         samples_up = []
 
-        # 5. Test Loop (Continuous Stream)
+        # 5. Test Loop
         self.request_stream_latency(50)
         self._start_streaming()
         
@@ -951,11 +950,12 @@ class BeaconProbe:
         curtime = self.reactor.monotonic()
         kin_status = self.kinematics.get_status(curtime)
         
+        # Ensure homed
         if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"] or "z" not in kin_status["homed_axes"]:
              gcmd.respond_info("Printer not homed. Homing now...")
              self.gcode.run_script_from_command("G28")
         
-        # Fast Move to Safe Z
+        # 1. Move to Safe Z (2.0mm) at 100mm/s
         self.toolhead.manual_move([None, None, 2.0], 100.0)
         self.toolhead.wait_moves()
 
@@ -1017,22 +1017,34 @@ class BeaconProbe:
 
             z_zero = np.mean(stop_samples)
             gcmd.respond_info(f"Contact zero found at {z_zero:.5f}")
-            gcmd.respond_info("Contact phase complete. Starting Beacon scan...")
             
+            # Move UP to 5mm for scan
             self.toolhead.manual_move([None, None, 5.0], self.lift_speed)
             self.toolhead.wait_moves()
             
+            # FIX: Correctly pass X/Y to prevent NoneType crash
             cur_pos = self.toolhead.get_position()
             self.toolhead.set_position([cur_pos[0], cur_pos[1], 5.0 - z_zero])
             
+            # Start Scan (Skip manual probe)
+            gcmd.respond_info("Contact phase complete. Starting Beacon scan...")
             self._start_calibration(gcmd, skip_manual_probe=True)
 
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
         
-        # FIX: Final cleanup after calibration is totally done
-        gcmd.respond_info("Auto Calibration complete. Homing...")
-        self.gcode.run_script_from_command("G28")
+        # FIX: Final Park & Home Sequence
+        gcmd.respond_info("Auto Calibration complete. Parking...")
+        
+        # 1. Move Z to 10mm 
+        self.toolhead.manual_move([None, None, 10.0], 30.0)
+        
+        # 2. Move XY to 0,0 at 30mm/s
+        self.toolhead.manual_move([0.0, 0.0, None], 30.0)
+        self.toolhead.wait_moves()
+        
+        # 3. Home using PROXIMITY to prevent infinite contact-homing loop
+        self.gcode.run_script_from_command("G28 METHOD=proximity")
 
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
@@ -1124,7 +1136,6 @@ class BeaconProbe:
         allow_faulty = gcmd.get_int("ALLOW_FAULTY_COORDINATE", 0) != 0
         nozzle_z = gcmd.get_float("NOZZLE_Z", self.cal_nozzle_z)
         
-        # FIX: Check the new argument OR the G-Code parameter
         if skip_manual_probe or gcmd.get("SKIP_MANUAL_PROBE", None) is not None:
             kin = self.kinematics
             kin_spos = {
@@ -1137,9 +1148,8 @@ class BeaconProbe:
                     raise gcmd.error(msg)
                 else:
                     gcmd.respond_raw(f"!! {msg}\n")
-            self._calibrate(gcmd, kin_pos, nozzle_z, False)
+            self._calibrate(gcmd, kin_pos, nozzle_z, False, is_auto=True)
         else:
-            # ... (Standard manual probe logic for G28/Calibrate) ...
             curtime = self.printer.get_reactor().monotonic()
             kin_status = self.toolhead.get_status(curtime)
             if "xy" not in kin_status["homed_axes"]:
