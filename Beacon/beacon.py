@@ -626,9 +626,10 @@ class BeaconProbe:
 
     cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
-        # FIX: Changed defaults to Z=1.5 and Overrun=0.5 so (1.5 - 0.5 = 1.0) > 0.5 safety limit
+        # FIX: Adjusted defaults to Z=1.5 and Overrun=0.5 so (1.5 - 0.5 = 1.0) > 0.5 safety limit
         overrun = gcmd.get_float("OVERRUN", 0.5)
         target_z_dist = gcmd.get_float("Z", 1.5)
+        
         num_samples = gcmd.get_int("SAMPLES", 20)
         sample_count_per_read = 50
         settle_time = self.z_settling_time
@@ -937,7 +938,9 @@ class BeaconProbe:
 
     cmd_BEACON_AUTO_CALIBRATE_help = "Automatically calibrates the Beacon probe"
     def cmd_BEACON_AUTO_CALIBRATE(self, gcmd):
-        # ... (keep existing setup code) ...
+        # Safety: Ensure stream is off before starting complex calibration
+        self._stop_streaming()
+        
         speed = gcmd.get_float("SPEED", self.autocal_speed, above=0, maxval=self.autocal_max_speed)
         desired_accel = gcmd.get_float("ACCEL", self.autocal_accel, minval=1)
         retract_dist = gcmd.get_float("RETRACT", self.autocal_retract_dist, minval=1)
@@ -955,7 +958,7 @@ class BeaconProbe:
              gcmd.respond_info("Printer not homed. Homing now...")
              self.gcode.run_script_from_command("G28")
         
-        # 1. Move to Safe Z (2.0mm)
+        # 1. Move to Safe Z (2.0mm) at 100mm/s
         self.toolhead.manual_move([None, None, 2.0], 100.0)
         self.toolhead.wait_moves()
 
@@ -1022,7 +1025,7 @@ class BeaconProbe:
             self.toolhead.manual_move([None, None, 5.0], self.lift_speed)
             self.toolhead.wait_moves()
             
-            # Set position (Fixed NoneType crash)
+            # FIX: Get current X/Y to avoid NoneType crash
             cur_pos = self.toolhead.get_position()
             self.toolhead.set_position([cur_pos[0], cur_pos[1], 5.0 - z_zero])
             
@@ -1032,13 +1035,13 @@ class BeaconProbe:
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
         
-        # 3. Final Park & Home (Outside finally block to ensure clean exit)
+        # 3. Final Park & Home Sequence
         gcmd.respond_info("Auto Calibration complete. Parking...")
         self.toolhead.manual_move([None, None, 10.0], 30.0)
         self.toolhead.manual_move([0.0, 0.0, None], 30.0)
         self.toolhead.wait_moves()
         
-        # Break recursion loop by forcing proximity method
+        # FIX: Use METHOD=proximity to break recursion loop
         self.gcode.run_script_from_command("G28 METHOD=proximity")
 
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
