@@ -627,14 +627,14 @@ class BeaconProbe:
     cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
         overrun = gcmd.get_float("OVERRUN", 1.0)
-        target_z_dist = gcmd.get_float("Z", self.trigger_distance)
+        # FIX: Default target Z closer (1.5mm) for better eddy signal
+        target_z_dist = gcmd.get_float("Z", 1.5) 
         num_samples = gcmd.get_int("SAMPLES", 20)
         sample_count_per_read = 50
         settle_time = self.z_settling_time
         
         approach_buffer = 0.5
         creep_speed = 3.0
-        # FIX: Reduced dwell time
         dwell_time = 0.1
         backlash_clearance = 2.0
         
@@ -650,8 +650,8 @@ class BeaconProbe:
         gcmd.respond_info("Homing...")
         self.gcode.run_script_from_command("G28")
         
-        # 2. Move to Safe Z (2.0mm)
-        self.toolhead.manual_move([None, None, 2.0], fast_speed)
+        # 2. Move to Safe Z
+        self.toolhead.manual_move([None, None, 10.0], fast_speed)
         self.toolhead.wait_moves()
         
         # 3. Move to Z_Start_test
@@ -666,7 +666,6 @@ class BeaconProbe:
         self.toolhead.wait_moves()
         self.toolhead.dwell(1.0)
         
-        # Safe single sample
         (baseline_dist, _) = self._sample(settle_time, sample_count_per_read)
         
         target_kin_z = self.toolhead.get_position()[2]
@@ -956,7 +955,7 @@ class BeaconProbe:
              gcmd.respond_info("Printer not homed. Homing now...")
              self.gcode.run_script_from_command("G28")
         
-        # FIX: Move to lower safe Z (2.0mm) quickly (100mm/s)
+        # Fast Move to Safe Z
         self.toolhead.manual_move([None, None, 2.0], 100.0)
         self.toolhead.wait_moves()
 
@@ -1018,27 +1017,37 @@ class BeaconProbe:
 
             z_zero = np.mean(stop_samples)
             gcmd.respond_info(f"Contact zero found at {z_zero:.5f}")
+            gcmd.respond_info("Contact phase complete. Starting Beacon scan...")
             
             self.toolhead.manual_move([None, None, 5.0], self.lift_speed)
             self.toolhead.wait_moves()
             
-            # FIX: Get current X/Y to avoid NoneType error in set_position
             cur_pos = self.toolhead.get_position()
             self.toolhead.set_position([cur_pos[0], cur_pos[1], 5.0 - z_zero])
             
-            # FIX: Pass skip_manual_probe=True to prevent falling into manual probe loop
             self._start_calibration(gcmd, skip_manual_probe=True)
 
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
+        
+        # FIX: Final cleanup after calibration is totally done
+        gcmd.respond_info("Auto Calibration complete. Homing...")
+        self.gcode.run_script_from_command("G28")
 
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
+    cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
     def cmd_BEACON_OFFSET_COMPARE(self, gcmd):
+        # 1. Homing Check (CRITICAL FIX)
+        curtime = self.reactor.monotonic()
+        kin_status = self.kinematics.get_status(curtime)
+        if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"] or "z" not in kin_status["homed_axes"]:
+             gcmd.respond_info("Printer not homed. Homing now...")
+             self.gcode.run_script_from_command("G28")
+
         start_pos = self.toolhead.get_position()
-        # Use config value or default to 2 (as per your request)
         num_samples = gcmd.get_int("SAMPLES", self.offset_compare_samples)
         
-        # 1. Move to Safe Z (2.0mm)
+        # 2. Move to Safe Z (2.0mm)
         self.toolhead.manual_move([None, None, 2.0], 50.0)
         self.toolhead.wait_moves()
 
@@ -1053,7 +1062,7 @@ class BeaconProbe:
             self.mcu_contact_probe.activate_gcode.run_gcode_from_command()
             try:
                 hmove = HomingMove(self.printer, [(self.mcu_contact_probe, "contact")])
-                # Use current X/Y
+                # Pass current X/Y explicitly
                 current_xy = self.toolhead.get_position()
                 target_pos = [current_xy[0], current_xy[1], -2.0]
                 
@@ -1068,7 +1077,7 @@ class BeaconProbe:
             self.toolhead.wait_moves()
             self.toolhead.dwell(0.5)
             
-            # 4. Measure
+            # 4. Measure Proximity
             self.request_stream_latency(50)
             self._start_streaming()
             (dist, samples) = self._sample(self.z_settling_time, 50)
@@ -1101,7 +1110,8 @@ class BeaconProbe:
         # 5. Cleanup
         gcmd.respond_info("Test complete. Cleaning up...")
         self.toolhead.manual_move([None, None, 2.0], 50.0)
-        self.toolhead.manual_move([start_pos[0], start_pos[1], None], 50.0)
+        if start_pos is not None:
+             self.toolhead.manual_move([start_pos[0], start_pos[1], None], 50.0)
         self.toolhead.wait_moves()
         self.gcode.run_script_from_command("G28")
 
