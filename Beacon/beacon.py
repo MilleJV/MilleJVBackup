@@ -623,7 +623,7 @@ class BeaconProbe:
 
     cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
-        # Get parameters
+        # ... (keep parameters setup) ...
         overrun = gcmd.get_float("OVERRUN", 1.0)
         speed = gcmd.get_float("PROBE_SPEED", self.speed, above=0.0)
         lift_speed = self.get_lift_speed(gcmd)
@@ -631,14 +631,13 @@ class BeaconProbe:
         num_samples = gcmd.get_int("SAMPLES", 20)
         settle_time = self.z_settling_time
         
-        # 1. Define "Creep" parameters for the final approach
-        approach_buffer = 0.5       # Start streaming 0.5mm away
-        creep_speed = 3.0           # Extremely slow final move for accuracy
-        dwell_time = 0.5            # Dwell before measuring
+        approach_buffer = 0.5 
+        creep_speed = 3.0
+        dwell_time = 0.5
 
-        # --- SAFETY FIX: Delta Specific Start Position ---
         cur_kin_z = self.toolhead.get_position()[2]
         
+        # Delta Safety Check
         if self.is_delta:
             kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
             max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
@@ -650,9 +649,8 @@ class BeaconProbe:
                 self.toolhead.manual_move([None, None, safe_start_z], speed)
                 self.toolhead.wait_moves()
                 cur_kin_z = safe_start_z
-        # -----------------------------------------------
-
-        # Perform the initial backlash clearing move (Stream OFF)
+        
+        # Initial Move
         self.toolhead.manual_move([None, None, cur_kin_z + overrun], speed)
         self.run_probe(gcmd) 
 
@@ -660,7 +658,6 @@ class BeaconProbe:
         samples_down = []
         next_dir = -1 
         
-        # Calculate the Machine Z target
         (current_dist, _samples) = self._sample(settle_time, 10)
         current_pos = self.toolhead.get_position()
         missing_dist = target_z_dist - current_dist
@@ -673,31 +670,30 @@ class BeaconProbe:
         try:
             while len(samples_up) + len(samples_down) < num_samples:
                 
-                # 1. Move to the "Overrun" position (Far away) - STREAM OFF
+                # 1. Fast Moves (Stream OFF)
                 start_pos_z = target_kin_z + (overrun * next_dir * -1)
                 self.toolhead.manual_move([None, None, start_pos_z], lift_speed)
                 
-                # 2. Move to "Approach" start (0.5mm away) - STREAM OFF
                 approach_start_z = target_kin_z + (approach_buffer * next_dir * -1)
                 self.toolhead.manual_move([None, None, approach_start_z], lift_speed)
                 self.toolhead.wait_moves()
 
-                # 3. Enable Stream for final creep
+                # 2. Start Stream (Latency 50)
+                # FIX: Changed 'self.beacon.request...' to 'self.request...'
                 self.request_stream_latency(50) 
                 self._start_streaming()
                 
-                # 4. Final Creep Move (3mm/s)
+                # 3. Slow Creep Move
                 self.toolhead.manual_move([None, None, target_kin_z], creep_speed)
                 self.toolhead.wait_moves()
-                
-                # 5. Dwell
                 self.toolhead.dwell(dwell_time)
                 
-                # 6. Measure
+                # 4. Measure
                 (dist, _samples) = self._sample(settle_time, 10)
                 
-                # 7. Disable Stream
+                # 5. Stop Stream
                 self._stop_streaming()
+                # FIX: Changed 'self.beacon.drop...' to 'self.drop...'
                 self.drop_stream_latency_request(50)
                 
                 if next_dir == -1:
@@ -709,6 +705,7 @@ class BeaconProbe:
 
         finally:
             self._stop_streaming()
+            # FIX: Changed 'self.beacon.drop...' to 'self.drop...'
             self.drop_stream_latency_request(50)
 
         res_up = median(samples_up)
@@ -873,11 +870,10 @@ class BeaconProbe:
                     )
                     f.write(log_line)
 
-                # CRITICAL FIX: Explicitly manage stream latency for Contact move
+                # FIX: Changed 'self.beacon.request...' to 'self.request...'
                 self.request_stream_latency(100)
-                self._start_streaming()
+                self._start_streaming() # self._start_streaming() is correct, no .beacon needed
 
-                # Poke sequence: Starts stream, then moves, then stops stream
                 with self.streaming_session(_poke_stream_callback, latency=100):
                     self._sample_async()
                     self.toolhead.get_last_move_time()
@@ -919,10 +915,9 @@ class BeaconProbe:
                         self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
                         self.toolhead.manual_move([None, None, top], 100.0)
                         self.toolhead.wait_moves()
-                        # Clean up the manual streaming requested by Poke
+                        # FIX: Changed 'self.beacon...' to 'self...'
                         self._stop_streaming()
                         self.drop_stream_latency_request(100)
-
         except OSError as e:
             gcmd.respond_info(f"Warning: Could not write poke data to {filename}: {e}")
 
