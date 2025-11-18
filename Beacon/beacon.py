@@ -623,101 +623,108 @@ class BeaconProbe:
 
     cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
-        # Get parameters
         overrun = gcmd.get_float("OVERRUN", 1.0)
         speed = gcmd.get_float("PROBE_SPEED", self.speed, above=0.0)
         lift_speed = self.get_lift_speed(gcmd)
         target_z_dist = gcmd.get_float("Z", self.trigger_distance)
-        
-        # OPTIMIZATION: Hardcode high sample count for accuracy
-        # 50 samples eliminates sensor noise variance
-        num_samples = gcmd.get_int("SAMPLES", 20) 
-        sample_count_per_read = 50 
-        
+        num_samples = gcmd.get_int("SAMPLES", 20)
+        sample_count_per_read = 50
         settle_time = self.z_settling_time
         
-        # 1. Define "Creep" parameters for the final approach
-        approach_buffer = 0.5       
-        creep_speed = 3.0           
-        dwell_time = 1.0  # Increased to 1.0s to let Delta effector stabilize
-
-        # --- SAFETY FIX: Delta Specific Start Position ---
-        cur_kin_z = self.toolhead.get_position()[2]
+        approach_buffer = 0.5
+        creep_speed = 3.0
+        dwell_time = 1.0
         
+        # "Clearance" move height above the start position for the backlash check
+        backlash_clearance = 2.0
+
+        # 1. Homing / Positioning Check
+        curtime = self.reactor.monotonic()
+        kin_status = self.kinematics.get_status(curtime)
+        
+        # If not homed or we are a delta (always safer to re-home if unsure), check status
+        if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"] or "z" not in kin_status["homed_axes"]:
+             gcmd.respond_info("Printer not homed. Homing now...")
+             self.gcode.run_script_from_command("G28")
+        
+        # 2. Move to Test Start Position (Fast)
+        # Target Z + Overrun is our "Base" position
+        start_pos_z = target_z_dist + overrun
+        
+        # Delta Safety: ensure we don't crash on the way down
         if self.is_delta:
-            kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
-            max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
-            safe_start_z = target_z_dist + overrun + 5.0
+            # Move to a safe high Z first if we are very low? 
+            # Actually, G28 just put us at max Z. We can move straight to start.
+            pass 
 
-            if cur_kin_z + overrun > max_z or cur_kin_z > safe_start_z:
-                gcmd.respond_info(f"Delta detected. Moving to safe Z: {safe_start_z:.2f}mm")
-                self.toolhead.manual_move([None, None, safe_start_z], speed)
-                self.toolhead.wait_moves()
-                cur_kin_z = safe_start_z
-        # -----------------------------------------------
+        gcmd.respond_info(f"Moving to start position Z={start_pos_z:.3f}")
+        self.toolhead.manual_move([None, None, start_pos_z], speed)
+        self.toolhead.wait_moves()
 
-        self.toolhead.manual_move([None, None, cur_kin_z + overrun], speed)
+        # 3. Initial Baseline Probe
         self.run_probe(gcmd) 
-
-        samples_up = []
-        samples_down = []
-        next_dir = -1 
         
+        samples = []
+        
+        # Calculate the Machine Z target based on the probe we just did
         (current_dist, _samples) = self._sample(settle_time, sample_count_per_read)
-        current_pos = self.toolhead.get_position()
-        missing_dist = target_z_dist - current_dist
-        target_kin_z = current_pos[2] + missing_dist
+        # target_kin_z is the machine coordinate where the beacon reads 'target_z_dist'
+        target_kin_z = self.toolhead.get_position()[2] - (current_dist - target_z_dist)
         
         gcmd.respond_info(f"Target kinematic Z is {target_kin_z:.3f}")
-        if target_kin_z - overrun < 0:
-            raise gcmd.error("Target minus overrun must exceed 0mm")
 
         try:
-            while len(samples_up) + len(samples_down) < num_samples:
-                
-                # 1. Fast Moves (Stream OFF)
-                start_pos_z = target_kin_z + (overrun * next_dir * -1)
-                self.toolhead.manual_move([None, None, start_pos_z], lift_speed)
-                
-                approach_start_z = target_kin_z + (approach_buffer * next_dir * -1)
-                self.toolhead.manual_move([None, None, approach_start_z], lift_speed)
+            for i in range(num_samples):
+                # A. Move to Approach Start (Stream OFF)
+                # This aligns us for the slow creep
+                approach_start = target_kin_z + approach_buffer
+                self.toolhead.manual_move([None, None, approach_start], lift_speed)
                 self.toolhead.wait_moves()
 
-                # 2. Start Stream (Latency 50 for better resolution)
+                # B. Enable Stream
                 self.request_stream_latency(50) 
                 self._start_streaming()
                 
-                # 3. Slow Creep Move
+                # C. Slow Creep Down to Target (Stream ON)
                 self.toolhead.manual_move([None, None, target_kin_z], creep_speed)
                 self.toolhead.wait_moves()
-                
-                # 4. Dwell
                 self.toolhead.dwell(dwell_time)
                 
-                # 5. Measure (High Sample Count)
+                # D. Measure
                 (dist, _samples) = self._sample(settle_time, sample_count_per_read)
+                samples.append(dist)
                 
-                # 6. Stop Stream
+                # E. Stop Stream
                 self._stop_streaming()
                 self.drop_stream_latency_request(50)
                 
-                if next_dir == -1:
-                    samples_up.append(dist)
-                else:
-                    samples_down.append(dist)
-                    
-                next_dir *= -1
+                gcmd.respond_info(f"Sample {i+1}/{num_samples}: {dist:.5f}")
+
+                # F. Backlash/Clearance Move (Stream OFF)
+                # Move UP to Start + Clearance
+                clearance_z = start_pos_z + backlash_clearance
+                self.toolhead.manual_move([None, None, clearance_z], lift_speed)
+                
+                # Move DOWN back to Start Position
+                self.toolhead.manual_move([None, None, start_pos_z], lift_speed)
+                self.toolhead.wait_moves()
 
         finally:
             self._stop_streaming()
             self.drop_stream_latency_request(50)
 
-        res_up = median(samples_up)
-        res_down = median(samples_down)
+        # Calculate Stats
+        avg = np.mean(samples)
+        median_val = median(samples)
+        sd = np.std(samples)
+        range_val = max(samples) - min(samples)
 
         gcmd.respond_info(
-            f"Median distance moving up {res_up:.5f}, down {res_down:.5f}, "
-            f"delta {res_down - res_up:.5f} over {num_samples} samples"
+            f"Backlash/Repeatability Test Results ({num_samples} samples):\n"
+            f"Median: {median_val:.5f}\n"
+            f"Mean: {avg:.5f}\n"
+            f"Standard Deviation: {sd:.5f}\n"
+            f"Range: {range_val:.5f}"
         )
 
     cmd_BEACON_QUERY_help = "Take a single sample from the sensor"
@@ -928,174 +935,162 @@ class BeaconProbe:
 
     cmd_BEACON_AUTO_CALIBRATE_help = "Automatically calibrates the Beacon probe"
     def cmd_BEACON_AUTO_CALIBRATE(self, gcmd):
-        speed = gcmd.get_float(
-            "SPEED", self.autocal_speed, above=0, maxval=self.autocal_max_speed
-        )
+        speed = gcmd.get_float("SPEED", self.autocal_speed, above=0, maxval=self.autocal_max_speed)
         desired_accel = gcmd.get_float("ACCEL", self.autocal_accel, minval=1)
         retract_dist = gcmd.get_float("RETRACT", self.autocal_retract_dist, minval=1)
-        retract_speed = gcmd.get_float(
-            "RETRACT_SPEED", self.autocal_retract_speed, minval=1
-        )
+        retract_speed = gcmd.get_float("RETRACT_SPEED", self.autocal_retract_speed, minval=1)
         sample_count = gcmd.get_int("SAMPLES", self.autocal_sample_count, minval=1)
-        tolerance = gcmd.get_float(
-            "SAMPLES_TOLERANCE", self.autocal_tolerance, above=0.0
-        )
-        max_retries = gcmd.get_int(
-            "SAMPLES_TOLERANCE_RETRIES", self.autocal_max_retries, minval=0
-        )
-
-        curtime = self.reactor.monotonic()
-        kin = self.kinematics
-        kin_status = kin.get_status(curtime)
-        if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"]:
-            raise gcmd.error("Must home X and Y axes first")
-
-        self.last_probe_result = "failed"
-        force_pos = self.toolhead.get_position()[:]
-        home_pos = force_pos[:]
+        tolerance = gcmd.get_float("SAMPLES_TOLERANCE", self.autocal_tolerance, above=0.0)
+        max_retries = gcmd.get_int("SAMPLES_TOLERANCE_RETRIES", self.autocal_max_retries, minval=0)
         
-        # --- BUG FIX ---
-        # Don't read axis_minimum, as it's often 0.0 on a delta.
-        # Instead, get the max height and use our hard-coded Z target.
-        amax = kin_status["axis_maximum"][2]
-        force_pos[2] = amax
-        home_pos[2] = self.CONTACT_PROBE_TARGET_Z # Use safe negative target
-        # --- END FIX ---
+        # FIX: Ensure the actual calibration scan runs at a reasonable speed (e.g. 3mm/s or user defined)
+        # Previously this defaulted to 1mm/s because self.cal_speed wasn't updated.
+        self.cal_speed = speed
+        
+        curtime = self.reactor.monotonic()
+        kin_status = self.kinematics.get_status(curtime)
+        
+        # FIX: Home if needed to prevent "Move out of range"
+        if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"] or "z" not in kin_status["homed_axes"]:
+             gcmd.respond_info("Printer not homed. Homing now...")
+             self.gcode.run_script_from_command("G28")
+        
+        # FIX: Move to safe Z quickly
+        # We simply move to 10mm height to start. This is safe on Deltas after homing.
+        self.toolhead.manual_move([None, None, 10.0], self.lift_speed) # Use fast lift speed
+        self.toolhead.wait_moves()
 
+        # Setup for contact
+        home_pos = self.toolhead.get_position()
+        home_pos[2] = self.CONTACT_PROBE_TARGET_Z 
+        
         stop_samples = []
-
         old_max_accel = self.toolhead.get_status(curtime)["max_accel"]
-        gcode = self.printer.lookup_object("gcode")
-
+        
         def set_max_accel(value):
-            gcode.run_script_from_command(f"SET_VELOCITY_LIMIT ACCEL={value:.3f}")
-
-        homing_state = BeaconHomingState()
-        self.printer.send_event("homing:home_rails_begin", homing_state, [])
+            self.gcode.run_script_from_command(f"SET_VELOCITY_LIMIT ACCEL={value:.3f}")
+            
         self.mcu_contact_probe.activate_gcode.run_gcode_from_command()
+        
         try:
-            self.compat_toolhead_set_position_homing_z(self.toolhead, force_pos)
             skip_next = True
             retries = 0
             while len(stop_samples) < sample_count:
-                if skip_next:
+                if skip_next: 
                     gcmd.respond_info("Initial approach")
-                else:
-                    gcmd.respond_info(f"Collecting sample {len(stop_samples) + 1}/{sample_count}")
-                    
+                else: 
+                    # FIX: Integer formatting
+                    gcmd.respond_info(f"Collecting sample {len(stop_samples) + 1}/{int(sample_count)}")
+                
                 self.toolhead.wait_moves()
                 set_max_accel(desired_accel)
+                
                 try:
-                    hmove = HomingMove(
-                        self.printer, [(self.mcu_contact_probe, "contact")]
-                    )
+                    hmove = HomingMove(self.printer, [(self.mcu_contact_probe, "contact")])
+                    # Contact approach at user 'speed' (usually 3mm/s)
                     epos = hmove.homing_move(home_pos, speed, probe_pos=True)
                 except self.printer.command_error:
-                    if self.printer.is_shutdown():
-                        raise self.printer.command_error(
-                            "Homing failed due to printer shutdown"
-                        )
+                    if self.printer.is_shutdown(): raise self.printer.command_error("Homing failed due to printer shutdown")
                     raise
                 finally:
                     set_max_accel(old_max_accel)
-
+                
+                # Retract
                 retract_pos = self.toolhead.get_position()[:]
                 retract_pos[2] += retract_dist
-                if retract_pos[2] > amax:
-                    retract_pos[2] = amax
                 self.toolhead.move(retract_pos, retract_speed)
-                self.toolhead.dwell(1.0) # Wait for vibrations to settle
-
+                self.toolhead.dwell(1.0) 
+                
                 if not skip_next:
+                    # FIX: Ensure we append the TRIGGERED position (epos), not current pos
                     stop_samples.append(epos[2])
+                    
                     mean = np.mean(stop_samples)
+                    # Calculate SD for user info
+                    sd = np.std(stop_samples)
+                    
                     delta = max([abs(v - mean) for v in stop_samples])
                     if delta > tolerance:
-                        if retries >= max_retries:
-                            raise gcmd.error(f"Sample spread too large({delta:.4f} > {tolerance:.4f})")
-                        gcmd.respond_info(
-                            f"Sample spread too large({delta:.4f} > {tolerance:.4f}), restarting"
-                        )
-                        retries += 1
+                        if retries >= max_retries: 
+                            raise gcmd.error(f"Calibration tolerance exceeded: range {delta:.4f} > {tolerance}")
+                        gcmd.respond_info(f"Tolerance exceeded ({delta:.4f}), retrying...")
                         stop_samples = []
+                        retries += 1
                         skip_next = True
+                    else:
+                         if len(stop_samples) > 1:
+                             gcmd.respond_info(f"Sample collected. Mean: {mean:.5f}, SD: {sd:.5f}")
                 else:
                     skip_next = False
 
-            gcmd.respond_info(f"Collected {len(stop_samples)} samples, {np.std(stop_samples):.4f} sd")
-
-            current_delta = force_pos[2] - self.toolhead.get_position()[2]
-            true_zero_delta = force_pos[2] - np.mean(stop_samples)
-
-            force_pos[2] = float(true_zero_delta - current_delta)
-            self.toolhead.set_position(force_pos)
-
-            self.toolhead.wait_moves()
-            self.toolhead.flush_step_generation()
-            self.last_probe_result = "ok"
-            self.printer.send_event("homing:home_rails_end", homing_state, [])
+            # Calculate final Z offset
+            z_zero = np.mean(stop_samples)
+            gcmd.respond_info(f"Contact zero found at {z_zero:.5f}")
             
-            if gcmd.get_int("SKIP_MODEL_CREATION", 0) == 0:
-                self._calibrate(gcmd, force_pos, force_pos[2], True, True)
+            # Apply offset for calibration
+            # Move UP to 5mm to start the magnetic scan
+            self.toolhead.manual_move([None, None, 5.0], self.lift_speed)
+            self.toolhead.wait_moves()
+            
+            # Sync kinematic position to the new zero
+            self.toolhead.set_position([None, None, 5.0 - z_zero])
+            
+            # Start Beacon Calibration
+            self._start_calibration(gcmd)
 
-        except self.printer.command_error:
-            self.compat_kin_note_z_not_homed(kin)
-            raise
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
 
-    cmd_BEACON_OFFSET_COMPARE_help = "Measures offset between contact and proximity measurements"
+    cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
     def cmd_BEACON_OFFSET_COMPARE(self, gcmd):
-        top = gcmd.get_float("TOP", self.OFFSET_COMPARE_DEFAULT_TOP)
-
-        self.last_probe_result = "failed"
-        self.toolhead.get_last_move_time()
-        self._sample_async()
+        # Store starting position for return
         start_pos = self.toolhead.get_position()
-
-        # Prepare parameters for _run_probe_contact
-        params = {
-            "SAMPLES_DROP": 1,
-            "SAMPLES": 3,
-        }
-        params.update(gcmd.get_command_parameters())
-        contact_probe_gcmd = self.gcode.create_gcode_command("PROBE", "PROBE", params)
-
-        # 1. Do contact probe
-        epos = self._run_probe_contact(contact_probe_gcmd)
-
-        # 2. Move up
-        self.toolhead.manual_move([None, None, top + 0.5], 100.0)
-
-        # 3. Move over to probe's XY
-        pos = start_pos[:2]
-        pos[0] -= self.x_offset
-        pos[1] -= self.y_offset
-        self.toolhead.manual_move(pos, 100.0)
-        self.toolhead.wait_moves()
-
-        # 4. Move down to probing height
-        self.toolhead.manual_move([None, None, 2.0], 100.0)
-
-        # 5. Query proximity distance
-        (dist, _samples) = self._sample(self.z_settling_time, 10)
-        dist_from_nozzle = 2.0 - dist # Calculate relative to nozzle
-
-        # 6. Move back to start
-        self.toolhead.manual_move(start_pos, 100.0)
-        self.toolhead.wait_moves()
-
-        delta = epos[2] - dist_from_nozzle
-        gcmd.respond_info(f"Comparing @ {start_pos[0]:.4f},{start_pos[1]:.4f}")
-        gcmd.respond_info(f"Contact:   {epos[2]:.5f} mm")
-        gcmd.respond_info(f"Proximity: {dist_from_nozzle:.5f} mm")
-        gcmd.respond_info(f"Delta:     {delta * 1000.0:.3f} um")
         
-        self.last_probe_result = "ok"
-        self.last_offset_result = {
-            "position": (start_pos[0], start_pos[1], epos[2]),
-            "delta": delta,
-        }
+        # 1. Safe Move to 10mm first
+        self.toolhead.manual_move([None, None, 10.0], 10.0)
+        self.toolhead.wait_moves()
+
+        # 2. Perform Contact Probe (Low Speed 3.0mm/s)
+        gcmd.respond_info("Probing with Contact (Speed 3.0)...")
+        self.mcu_contact_probe.activate_gcode.run_gcode_from_command()
+        try:
+            hmove = HomingMove(self.printer, [(self.mcu_contact_probe, "contact")])
+            # Safe slow probe
+            epos = hmove.homing_move([None, None, -2.0], 3.0, probe_pos=True) 
+            contact_z = epos[2]
+        finally:
+            self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
+
+        gcmd.respond_info(f"Contact trigger at Z={contact_z:.5f}")
+
+        # 3. Retract and measure with Proximity
+        # Move up by 3mm relative to contact point
+        measure_z = contact_z + 3.0
+        self.toolhead.manual_move([None, None, measure_z], 5.0)
+        self.toolhead.wait_moves()
+        self.toolhead.dwell(0.5)
+        
+        # Measure
+        (dist, samples) = self._sample(self.z_settling_time, 50) 
+        proximity_z = measure_z - dist # Calculated surface Z
+        
+        delta = contact_z - proximity_z 
+        gcmd.respond_info(
+            f"Comparing @ {epos[0]:.4f},{epos[1]:.4f}\n"
+            f"Contact:   {contact_z:.5f} mm\n"
+            f"Proximity: {proximity_z:.5f} mm\n"
+            f"Delta:     {delta * 1000.0:.3f} um"
+        )
+        
+        # 4. CLEANUP: Return to Start & Safe Home
+        gcmd.respond_info("Test complete. Returning to safety.")
+        # Move Z up to safe 10mm
+        self.toolhead.manual_move([None, None, 10.0], 10.0)
+        # Move X/Y back to start
+        self.toolhead.manual_move([start_pos[0], start_pos[1], None], 50.0)
+        self.toolhead.wait_moves()
+        # Re-home for safety
+        self.gcode.run_script_from_command("G28")
 
     # --- Core Probing Logic ---
 
