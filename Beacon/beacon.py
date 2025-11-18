@@ -624,79 +624,125 @@ class BeaconProbe:
     cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
         overrun = gcmd.get_float("OVERRUN", 1.0)
-        speed = gcmd.get_float("PROBE_SPEED", self.speed, above=0.0)
-        lift_speed = self.get_lift_speed(gcmd)
         target_z_dist = gcmd.get_float("Z", self.trigger_distance)
         num_samples = gcmd.get_int("SAMPLES", 20)
         sample_count_per_read = 50
         settle_time = self.z_settling_time
         
-        # 1. Home (Always)
+        approach_buffer = 0.5
+        creep_speed = 3.0
+        dwell_time = 1.0
+        
+        # Speeds (from config logic ideally, but safe defaults here)
+        fast_speed = 100.0  # For Safe Z
+        cycle_speed = 30.0  # For positioning
+
+        # 1. Safety Check
+        if target_z_dist - overrun < 0.5:
+            raise gcmd.error(
+                f"Test target ({target_z_dist}) minus overrun ({overrun}) is too close to bed! "
+                "Decrease OVERRUN or increase Z."
+            )
+
+        # 2. Home (Mandatory for Delta safety)
         gcmd.respond_info("Homing...")
         self.gcode.run_script_from_command("G28")
         
-        # 2. Move to Safe Z (Fast)
-        self.toolhead.manual_move([None, None, 10.0], lift_speed)
-        self.toolhead.wait_moves()
-        
-        # 3. Move to Z_Start_test (Slightly Slower)
-        # We start 2mm above the target distance
-        start_z = target_z_dist + 2.0
-        gcmd.respond_info(f"Moving to start position Z={start_z:.3f}")
-        self.toolhead.manual_move([None, None, start_z], speed)
+        # 3. Move to Safe Z
+        self.toolhead.manual_move([None, None, 10.0], fast_speed)
         self.toolhead.wait_moves()
 
-        # 4. Baseline Measure (Extremely Slow)
-        gcmd.respond_info("Taking baseline measurement...")
-        # Move to measurement point (target_z_dist) extremely slowly
-        self.toolhead.manual_move([None, None, target_z_dist], 1.0) # 1mm/s
+        # 4. Baseline Measure (Down Approach)
+        start_pos_z = target_z_dist + overrun
+        gcmd.respond_info(f"Moving to start position Z={start_pos_z:.3f}")
+        self.toolhead.manual_move([None, None, start_pos_z], cycle_speed)
+        
+        # Creep down to target
+        self.toolhead.manual_move([None, None, target_z_dist], 1.0)
         self.toolhead.wait_moves()
         self.toolhead.dwell(1.0)
         
-        with self.streaming_session(latency=50):
-            (baseline_dist, _) = self._sample(settle_time, sample_count_per_read)
-            
-        gcmd.respond_info(f"Baseline distance: {baseline_dist:.5f}")
+        # Measure Baseline
+        self.request_stream_latency(50)
+        self._start_streaming()
+        (baseline_dist, _) = self._sample(0, sample_count_per_read)
+        self._stop_streaming()
+        self.drop_stream_latency_request(50)
+        
+        # Calculate machine Z for the target distance
+        target_kin_z = self.toolhead.get_position()[2]
+        gcmd.respond_info(f"Baseline: {baseline_dist:.5f} at Machine Z: {target_kin_z:.4f}")
 
-        samples = []
-        cycle_speed = 30.0 # 30mm/s for the backlash moves
+        samples_down = []
+        samples_up = []
 
-        # 5. Backlash Test Loop
-        for i in range(num_samples):
-            # A. Move Up (Semi-Quick) to Start + Overrun
-            up_pos = start_z + overrun
-            self.toolhead.manual_move([None, None, up_pos], cycle_speed)
-            
-            # B. Move Down (Semi-Quick) back to measurement point
-            self.toolhead.manual_move([None, None, target_z_dist], cycle_speed)
-            self.toolhead.wait_moves()
-            self.toolhead.dwell(0.5) # Brief settle
-            
-            # C. Measure
-            with self.streaming_session(latency=50):
-                (dist, _) = self._sample(settle_time, sample_count_per_read)
-            
-            samples.append(dist)
-            diff = dist - baseline_dist
-            gcmd.respond_info(f"Sample {i+1}/{num_samples}: {dist:.5f} (Diff: {diff:.5f})")
+        try:
+            for i in range(num_samples):
+                # --- DOWN SAMPLE (Approach from Above) ---
+                # 1. Move Up to Start
+                up_pos = target_kin_z + overrun
+                self.toolhead.manual_move([None, None, up_pos], cycle_speed)
+                
+                # 2. Approach (Stream ON)
+                self.request_stream_latency(50)
+                self._start_streaming()
+                self.toolhead.manual_move([None, None, target_kin_z], creep_speed)
+                self.toolhead.wait_moves()
+                self.toolhead.dwell(dwell_time)
+                
+                # 3. Measure
+                (dist_down, _) = self._sample(0, sample_count_per_read)
+                samples_down.append(dist_down)
+                
+                # 4. Stop Stream
+                self._stop_streaming()
+                self.drop_stream_latency_request(50)
 
-        # 6. Finish
-        self.toolhead.manual_move([None, None, 10.0], lift_speed)
+                # --- UP SAMPLE (Approach from Below) ---
+                # 1. Move Down to Low Start
+                low_pos = target_kin_z - overrun
+                self.toolhead.manual_move([None, None, low_pos], cycle_speed)
+                
+                # 2. Approach Up (Stream ON)
+                self.request_stream_latency(50)
+                self._start_streaming()
+                self.toolhead.manual_move([None, None, target_kin_z], creep_speed)
+                self.toolhead.wait_moves()
+                self.toolhead.dwell(dwell_time)
+                
+                # 3. Measure
+                (dist_up, _) = self._sample(0, sample_count_per_read)
+                samples_up.append(dist_up)
+                
+                # 4. Stop Stream
+                self._stop_streaming()
+                self.drop_stream_latency_request(50)
+
+                diff = dist_up - dist_down
+                gcmd.respond_info(
+                    f"Sample {i+1}/{num_samples}: Down={dist_down:.5f}, Up={dist_up:.5f}, Backlash={diff:.5f}"
+                )
+
+        finally:
+            self._stop_streaming()
+            self.drop_stream_latency_request(50)
+
+        # 5. Finish
+        self.toolhead.manual_move([None, None, 10.0], fast_speed)
         self.gcode.run_script_from_command("G28")
 
         # Stats
-        avg = np.mean(samples)
-        median_val = median(samples)
-        sd = np.std(samples)
-        range_val = max(samples) - min(samples)
+        avg_down = np.mean(samples_down)
+        avg_up = np.mean(samples_up)
+        median_backlash = median([u - d for u, d in zip(samples_up, samples_down)])
+        avg_backlash = avg_up - avg_down
 
         gcmd.respond_info(
-            f"Backlash/Repeatability Results ({num_samples} samples):\n"
-            f"Baseline: {baseline_dist:.5f}\n"
-            f"Median: {median_val:.5f}\n"
-            f"Mean: {avg:.5f}\n"
-            f"Standard Deviation: {sd:.5f}\n"
-            f"Range: {range_val:.5f}"
+            f"Backlash Results ({num_samples} cycles):\n"
+            f"Avg Down (Push): {avg_down:.5f}\n"
+            f"Avg Up (Pull):   {avg_up:.5f}\n"
+            f"Avg Backlash:    {avg_backlash:.5f}\n"
+            f"Median Backlash: {median_backlash:.5f}"
         )
 
     cmd_BEACON_QUERY_help = "Take a single sample from the sensor"
@@ -1002,12 +1048,13 @@ class BeaconProbe:
 
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
     def cmd_BEACON_OFFSET_COMPARE(self, gcmd):
-        # 1. Move to Safe Z and Center (Fast)
+        start_pos = self.toolhead.get_position()
+        
+        # 1. Move to Safe Z
         self.toolhead.manual_move([None, None, 10.0], 50.0)
-        self.toolhead.manual_move([0.0, 0.0, None], 50.0)
         self.toolhead.wait_moves()
 
-        # 2. Perform Contact Probe (Safe Speed 3.0)
+        # 2. Perform Contact Probe (Speed 3.0)
         gcmd.respond_info("Probing with Contact (Speed 3.0)...")
         self.mcu_contact_probe.activate_gcode.run_gcode_from_command()
         try:
@@ -1019,15 +1066,19 @@ class BeaconProbe:
 
         gcmd.respond_info(f"Contact trigger at Z={contact_z:.5f}")
 
-        # 3. Retract and measure with Proximity
+        # 3. Retract and measure
         measure_z = contact_z + 3.0
         self.toolhead.manual_move([None, None, measure_z], 10.0)
         self.toolhead.wait_moves()
         self.toolhead.dwell(0.5)
         
-        # Measure (using session to prevent crashes)
-        with self.streaming_session(latency=50):
-            (dist, samples) = self._sample(self.z_settling_time, 50) 
+        # 4. Measure (Crash Fix: No streaming_session wrapper)
+        # Manually request latency if desired, though _sample defaults are usually fine
+        self.request_stream_latency(50)
+        self._start_streaming()
+        (dist, samples) = self._sample(self.z_settling_time, 50) 
+        self._stop_streaming()
+        self.drop_stream_latency_request(50)
         
         proximity_z = measure_z - dist 
         delta = contact_z - proximity_z 
@@ -1039,9 +1090,10 @@ class BeaconProbe:
             f"Delta:     {delta * 1000.0:.3f} um"
         )
         
-        # 4. CLEANUP: Safe Z and Home
+        # 5. Cleanup
         gcmd.respond_info("Test complete. Cleaning up...")
         self.toolhead.manual_move([None, None, 10.0], 50.0)
+        self.toolhead.manual_move([start_pos[0], start_pos[1], None], 50.0)
         self.toolhead.wait_moves()
         self.gcode.run_script_from_command("G28")
 
