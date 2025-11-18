@@ -626,9 +626,10 @@ class BeaconProbe:
 
     cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
-        overrun = gcmd.get_float("OVERRUN", 1.0)
-        # FIX: Target 1.0mm for closer measurement
-        target_z_dist = gcmd.get_float("Z", 1.0)
+        # FIX: Adjusted defaults to satisfy safety check (1.5 - 0.5 = 1.0 > 0.5)
+        overrun = gcmd.get_float("OVERRUN", 0.5)
+        target_z_dist = gcmd.get_float("Z", 1.5)
+        
         num_samples = gcmd.get_int("SAMPLES", 20)
         sample_count_per_read = 50
         settle_time = self.z_settling_time
@@ -643,7 +644,7 @@ class BeaconProbe:
 
         if target_z_dist - overrun < 0.5:
             raise gcmd.error(
-                f"Test target ({target_z_dist}) minus overrun ({overrun}) is too close to bed!"
+                f"Test target ({target_z_dist}) minus overrun ({overrun}) is too close to bed! (Min safe height is 0.5mm)"
             )
 
         # 1. Home
@@ -950,7 +951,6 @@ class BeaconProbe:
         curtime = self.reactor.monotonic()
         kin_status = self.kinematics.get_status(curtime)
         
-        # Ensure homed
         if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"] or "z" not in kin_status["homed_axes"]:
              gcmd.respond_info("Printer not homed. Homing now...")
              self.gcode.run_script_from_command("G28")
@@ -1017,33 +1017,27 @@ class BeaconProbe:
 
             z_zero = np.mean(stop_samples)
             gcmd.respond_info(f"Contact zero found at {z_zero:.5f}")
+            gcmd.respond_info("Contact phase complete. Starting Beacon scan...")
             
             # Move UP to 5mm for scan
             self.toolhead.manual_move([None, None, 5.0], self.lift_speed)
             self.toolhead.wait_moves()
             
-            # FIX: Correctly pass X/Y to prevent NoneType crash
+            # Set position to Contact Z (fixes crash)
             cur_pos = self.toolhead.get_position()
             self.toolhead.set_position([cur_pos[0], cur_pos[1], 5.0 - z_zero])
             
             # Start Scan (Skip manual probe)
-            gcmd.respond_info("Contact phase complete. Starting Beacon scan...")
             self._start_calibration(gcmd, skip_manual_probe=True)
 
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
         
-        # FIX: Final Park & Home Sequence
-        gcmd.respond_info("Auto Calibration complete. Parking...")
-        
-        # 1. Move Z to 10mm 
+        # Cleanup: Just lift Z and Home
+        gcmd.respond_info("Auto Calibration complete. Homing...")
         self.toolhead.manual_move([None, None, 10.0], 30.0)
-        
-        # 2. Move XY to 0,0 at 30mm/s
-        self.toolhead.manual_move([0.0, 0.0, None], 30.0)
         self.toolhead.wait_moves()
-        
-        # 3. Home using PROXIMITY to prevent infinite contact-homing loop
+        # Force proximity homing to prevent infinite loops
         self.gcode.run_script_from_command("G28 METHOD=proximity")
 
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
