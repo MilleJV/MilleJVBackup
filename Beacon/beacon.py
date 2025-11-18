@@ -937,6 +937,7 @@ class BeaconProbe:
 
     cmd_BEACON_AUTO_CALIBRATE_help = "Automatically calibrates the Beacon probe"
     def cmd_BEACON_AUTO_CALIBRATE(self, gcmd):
+        # ... (keep existing setup code) ...
         speed = gcmd.get_float("SPEED", self.autocal_speed, above=0, maxval=self.autocal_max_speed)
         desired_accel = gcmd.get_float("ACCEL", self.autocal_accel, minval=1)
         retract_dist = gcmd.get_float("RETRACT", self.autocal_retract_dist, minval=1)
@@ -954,7 +955,7 @@ class BeaconProbe:
              gcmd.respond_info("Printer not homed. Homing now...")
              self.gcode.run_script_from_command("G28")
         
-        # 1. Move to Safe Z (2.0mm) at 100mm/s
+        # 1. Move to Safe Z (2.0mm)
         self.toolhead.manual_move([None, None, 2.0], 100.0)
         self.toolhead.wait_moves()
 
@@ -1016,31 +1017,28 @@ class BeaconProbe:
 
             z_zero = np.mean(stop_samples)
             gcmd.respond_info(f"Contact zero found at {z_zero:.5f}")
-            gcmd.respond_info("Contact phase complete. Starting Beacon scan...")
             
             # Move UP to 5mm for scan
             self.toolhead.manual_move([None, None, 5.0], self.lift_speed)
             self.toolhead.wait_moves()
             
-            # FIX: Get current X/Y to avoid NoneType crash
+            # Set position (Fixed NoneType crash)
             cur_pos = self.toolhead.get_position()
             self.toolhead.set_position([cur_pos[0], cur_pos[1], 5.0 - z_zero])
             
-            # Start Scan (Skip manual probe)
+            gcmd.respond_info("Contact phase complete. Starting Beacon scan...")
             self._start_calibration(gcmd, skip_manual_probe=True)
 
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
         
-        # FIX: Final Park & Home Sequence
+        # 3. Final Park & Home (Outside finally block to ensure clean exit)
         gcmd.respond_info("Auto Calibration complete. Parking...")
-        # 1. Move Z to 10mm at 30mm/s
         self.toolhead.manual_move([None, None, 10.0], 30.0)
-        # 2. Move XY to 0,0 at 30mm/s
         self.toolhead.manual_move([0.0, 0.0, None], 30.0)
         self.toolhead.wait_moves()
         
-        # 3. Home using PROXIMITY to prevent infinite contact-homing loop
+        # Break recursion loop by forcing proximity method
         self.gcode.run_script_from_command("G28 METHOD=proximity")
 
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
@@ -1454,18 +1452,17 @@ class BeaconProbe:
     # --- Streaming Sub-system ---
 
     def _start_streaming(self):
-        if self._stream_en == 0:
+        if self._stream_en == 0: 
+            # Only send command and reset filter if stream isn't already running
             if self.beacon_stream_cmd is not None:
                 self.beacon_stream_cmd.send([1])
                 curtime = self.reactor.monotonic()
                 self.reactor.update_timer(
                     self._stream_timeout_timer, curtime + STREAM_TIMEOUT
                 )
-            # FIX: Only reset filter on the FIRST start of the stream.
-            # Resetting it on nested calls (count > 0) wipes valid data 
-            # and causes the "sensor not receiving data" or "-inf" errors.
-            self._data_filter.reset()
+            self._data_filter.reset() # <--- MOVED INSIDE THE IF BLOCK
             self._stream_flush()
+            
         self._stream_en += 1
 
     def _stop_streaming(self):
