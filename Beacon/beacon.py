@@ -666,17 +666,10 @@ class BeaconProbe:
         samples_up = []
 
         # 4. Test Loop with Continuous Stream
-        # We keep the stream open to avoid start/stop instability
         self.request_stream_latency(50)
         self._start_streaming()
         
         try:
-            # Dummy callback to keep stream alive
-            def no_op(s): pass
-            
-            # Create a session context but we won't use 'with' for the loop to avoid nesting issues
-            # We just rely on the manual start above and _sample's ability to piggyback
-            
             for i in range(num_samples):
                 # --- DOWN SAMPLE ---
                 # Move Up (Clearance)
@@ -693,9 +686,8 @@ class BeaconProbe:
                 samples_down.append(dist_down)
                 
                 # --- UP SAMPLE ---
-                # Move Down (Clearance) - Careful with bed!
+                # Move Down (Clearance)
                 low_pos = target_kin_z - overrun
-                # Safety clamp
                 if low_pos < 0.1: low_pos = 0.1
                 self.toolhead.manual_move([None, None, low_pos], cycle_speed)
                 
@@ -1024,10 +1016,14 @@ class BeaconProbe:
             z_zero = np.mean(stop_samples)
             gcmd.respond_info(f"Contact zero found at {z_zero:.5f}")
             
+            # Move UP to 5mm for scan
             self.toolhead.manual_move([None, None, 5.0], 100.0)
             self.toolhead.wait_moves()
             
-            self.toolhead.set_position([None, None, 5.0 - z_zero])
+            # FIX: Get current X/Y positions to satisfy set_position requirements
+            cur_pos = self.toolhead.get_position()
+            self.toolhead.set_position([cur_pos[0], cur_pos[1], 5.0 - z_zero])
+            
             self._start_calibration(gcmd)
 
         finally:
@@ -1046,7 +1042,6 @@ class BeaconProbe:
 
         for i in range(num_samples):
             # 2. Perform Contact Probe (Speed 3.0)
-            # We only log the "Probing..." message once to keep console clean, or on every step if multiple
             if num_samples == 1:
                 gcmd.respond_info("Probing with Contact (Speed 3.0)...")
             else:
@@ -1055,22 +1050,24 @@ class BeaconProbe:
             self.mcu_contact_probe.activate_gcode.run_gcode_from_command()
             try:
                 hmove = HomingMove(self.printer, [(self.mcu_contact_probe, "contact")])
-                # Pass current X/Y to avoid the TypeError crash
-                target_pos = [start_pos[0], start_pos[1], -2.0]
+                
+                # FIX: Pass current X/Y to homing_move to avoid 'NoneType' subtraction errors
+                # We assume we are already at the correct XY from step 1/start
+                current_xy = self.toolhead.get_position()
+                target_pos = [current_xy[0], current_xy[1], -2.0]
+                
                 epos = hmove.homing_move(target_pos, 3.0, probe_pos=True) 
                 contact_z = epos[2]
             finally:
                 self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
 
             # 3. Retract and measure
-            # Move up 3mm relative to where we just touched
             measure_z = contact_z + 3.0
             self.toolhead.manual_move([None, None, measure_z], 10.0)
             self.toolhead.wait_moves()
             self.toolhead.dwell(0.5)
             
             # 4. Measure Proximity
-            # Standard 50ms latency for accuracy
             self.request_stream_latency(50)
             self._start_streaming()
             (dist, samples) = self._sample(self.z_settling_time, 50)
@@ -1084,9 +1081,6 @@ class BeaconProbe:
             gcmd.respond_info(
                 f"Sample {i+1}: Contact={contact_z:.5f}, Proximity={proximity_z:.5f}, Delta={delta * 1000.0:.3f} um"
             )
-            
-            # If looping, we are already at 'measure_z' (Contact + 3mm).
-            # This is a safe height to start the next Contact probe from.
 
         # Stats
         if num_samples > 1:
@@ -1105,12 +1099,10 @@ class BeaconProbe:
         
         # 5. Cleanup
         gcmd.respond_info("Test complete. Cleaning up...")
-        # Move Z up to safe 10mm
         self.toolhead.manual_move([None, None, 10.0], 50.0)
         # Move X/Y back to start
         self.toolhead.manual_move([start_pos[0], start_pos[1], None], 50.0)
         self.toolhead.wait_moves()
-        # Re-home for safety
         self.gcode.run_script_from_command("G28")
 
     # --- Core Probing Logic ---
