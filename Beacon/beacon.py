@@ -1872,32 +1872,17 @@ class BeaconProbe:
             self.toolhead.manual_move([None, None, top], speed)
         self.toolhead.manual_move([None, None, target], speed)
         self.toolhead.wait_moves()
-
-
-# --- Accelerometer Interface (Delegation) ---
-    # These methods are required by [resonance_tester]
-    # and other Klipper modules. They delegate the calls
-    # to the internal BeaconAccelHelper instance.
+    
+    # --- Accelerometer Public Interface ---
+        # These methods are required by [resonance_tester]
+        # and other Klipper modules. They delegate the calls
+        # to the internal BeaconAccelHelper instance.
 
     def start_internal_client(self):
-        if not self.accel_helper:
-            raise self.gcode.error(f"'{self.name}' is not an accelerometer")
-        return self.accel_helper.start_internal_client()
-
-    def is_measuring(self):
-        if not self.accel_helper:
-            return False
-        return self.accel_helper.is_measuring()
-
-    def read_reg(self, reg):
-        if not self.accel_helper:
-            raise self.gcode.error(f"'{self.name}' is not an accelerometer")
-        return self.accel_helper.read_reg(reg)
-
-    def set_reg(self, reg, val, minclock=0):
-        if not self.accel_helper:
-            raise self.gcode.error(f"'{self.name}' is not an accelerometer")
-        return self.accel_helper.set_reg(reg, val, minclock)
+        # Logic check removed because we are already inside the helper
+        cli = AccelInternalClient(self.beacon.printer)
+        self._api_dump.add_client(cli._handle_data)
+        return cli
 
 
 class BeaconModel:
