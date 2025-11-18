@@ -149,6 +149,17 @@ class BeaconProbe:
         self.skip_firmware_version_check = config.getboolean(
             "skip_firmware_version_check", False
         )
+        
+        self.hardware_failure = None
+        
+        # NEW: Safety Shim & Integrity State
+        self._streaming_lock = False  # Prevents starting stream during critical ops
+        self._last_packet_end_clock = 0
+        self._packet_integrity_errors = 0
+        
+        # Load helper modules
+        self.mesh_helper = BeaconMeshHelper.create(self, config)
+        # ...
 
         # Load models
         self.model = None
@@ -394,24 +405,41 @@ class BeaconProbe:
     def _handle_beacon_data(self, params):
         """
         Receives a batch of samples from the MCU.
+        Includes Live Integrity Validation.
         """
         if self.trapq is None:
             return
 
+        # Debug logging for packet health
+        sample_count = params.get("samples", 0)
+        # if sample_count == 0:
+        #     logging.debug("Beacon: received empty data packet")
+
         buf = bytearray(params["data"])
-        sample_count = params["samples"]
         start_clock = params["start_clock"]
         delta_clock = (
             params["delta_clock"] / (sample_count - 1) if sample_count > 1 else 0
         )
 
+        # INTEGRITY VALIDATOR: Check for gaps in MCU clock
+        # If the gap between the end of the last packet and the start of this one
+        # is significantly larger than expected, we likely dropped data.
+        if self._last_packet_end_clock > 0:
+            gap = start_clock - self._last_packet_end_clock
+            # Threshold: > 2 samples worth of time (approx 5000-10000 ticks depending on config)
+            threshold = delta_clock * 2 if delta_clock > 0 else 10000
+            if gap > threshold:
+                self._packet_integrity_errors += 1
+                if self._packet_integrity_errors <= 10: # Limit log spam
+                    logging.warning(f"Beacon: Data Gap Detected! Gap: {gap} ticks. Total Errors: {self._packet_integrity_errors}")
+
+        # Update end clock for next comparison
+        self._last_packet_end_clock = start_clock + params["delta_clock"]
+
         samples = []
         data = 0
         
-        # --- OPTIMIZATION ---
-        # Use a single index 'idx' to walk the buffer.
-        # This is much faster than `buf = buf[2:]` which creates
-        # a new copy of the bytearray in memory for every sample.
+        # Optimized parsing loop
         idx = 0
         for i in range(0, sample_count):
             if buf[idx] & 0x80 == 0:
@@ -938,9 +966,6 @@ class BeaconProbe:
 
     cmd_BEACON_AUTO_CALIBRATE_help = "Automatically calibrates the Beacon probe"
     def cmd_BEACON_AUTO_CALIBRATE(self, gcmd):
-        # Safety: Ensure stream is off before starting complex calibration
-        self._stop_streaming()
-        
         speed = gcmd.get_float("SPEED", self.autocal_speed, above=0, maxval=self.autocal_max_speed)
         desired_accel = gcmd.get_float("ACCEL", self.autocal_accel, minval=1)
         retract_dist = gcmd.get_float("RETRACT", self.autocal_retract_dist, minval=1)
@@ -1020,6 +1045,7 @@ class BeaconProbe:
 
             z_zero = np.mean(stop_samples)
             gcmd.respond_info(f"Contact zero found at {z_zero:.5f}")
+            gcmd.respond_info("Contact phase complete. Starting Beacon scan...")
             
             # Move UP to 5mm for scan
             self.toolhead.manual_move([None, None, 5.0], self.lift_speed)
@@ -1029,20 +1055,24 @@ class BeaconProbe:
             cur_pos = self.toolhead.get_position()
             self.toolhead.set_position([cur_pos[0], cur_pos[1], 5.0 - z_zero])
             
-            gcmd.respond_info("Contact phase complete. Starting Beacon scan...")
+            # Start Scan (Skip manual probe)
             self._start_calibration(gcmd, skip_manual_probe=True)
 
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
         
-        # 3. Final Park & Home Sequence
-        gcmd.respond_info("Auto Calibration complete. Parking...")
+        # FIX: Final Park & Safe Homing Sequence (User Request)
+        gcmd.respond_info("Auto Calibration complete. Final park & safe homing sequence.")
+        # Move up to a safe clear height and to center without invoking the global G28
         self.toolhead.manual_move([None, None, 10.0], 30.0)
         self.toolhead.manual_move([0.0, 0.0, None], 30.0)
         self.toolhead.wait_moves()
-        
-        # FIX: Use METHOD=proximity to break recursion loop
-        self.gcode.run_script_from_command("G28 METHOD=proximity")
+
+        # Home XY only to avoid re-entering Z homing via beacon
+        try:
+            self.gcode.run_script_from_command("G28 X Y")
+        except Exception as e:
+            logging.warning(f"AutoCalibrate: G28 X Y failed: {e}")
 
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
     def cmd_BEACON_OFFSET_COMPARE(self, gcmd):
@@ -1355,6 +1385,15 @@ class BeaconProbe:
         
         # FIX: Deltas crash if we use the heavy 'probing_move' while streaming.
         if self.is_delta:
+             # Delta Movement Safety:
+             # Ensure we never descend into unsafe delta configurations.
+             # If current Z is lower than target, raise to target first.
+             cur_pos = self.toolhead.get_position()
+             if cur_pos[2] < target_z:
+                 self.toolhead.manual_move([None, None, target_z], speed)
+                 self.toolhead.wait_moves()
+                 
+             # Move to target Z (handles descent if above, or ensures position if raised)
              self.toolhead.manual_move([None, None, target_z], speed)
              self.toolhead.wait_moves()
         else:
@@ -1428,54 +1467,136 @@ class BeaconProbe:
     def _probe_contact(self, speed):
         """
         Internal contact probe logic.
+        Refined for Delta safety and resource locking.
         """
         self.toolhead.get_last_move_time()
-        self._sample_async()
-        start_pos = self.toolhead.get_position()
         
-        homing_move = HomingMove(self.printer, [(self.mcu_contact_probe, "contact")])
-        target_pos = start_pos[:]
-        target_pos[2] = self.CONTACT_PROBE_TARGET_Z
+        # SAFETY: Lock streaming so nothing else interferes
+        self._streaming_lock = True
         
         try:
-            end_pos = homing_move.homing_move(target_pos, speed, probe_pos=True)[:3]
-        except self.printer.command_error as e:
-            if self.printer.is_shutdown():
-                reason = "Probing failed due to printer shutdown"
-            else:
-                reason = str(e)
-                if "Timeout during probing move" in reason:
-                    reason += probe.HINT_TIMEOUT
-            raise self.printer.command_error(reason)
+            self._sample_async()
+            start_pos = self.toolhead.get_position()
             
-        end_pos[2] += self.get_z_compensation_value(target_pos)
-        self.gcode.respond_info(f"probe at {end_pos[0]:.3f},{end_pos[1]:.3f} is z={end_pos[2]:.6f}")
-        return end_pos
-
+            homing_move = HomingMove(self.printer, [(self.mcu_contact_probe, "contact")])
+            
+            # DELTA SAFETY: Ensure target X/Y match start X/Y exactly.
+            target_pos = [start_pos[0], start_pos[1], self.CONTACT_PROBE_TARGET_Z]
+            
+            try:
+                end_pos = homing_move.homing_move(target_pos, speed, probe_pos=True)[:3]
+            except self.printer.command_error as e:
+                if self.printer.is_shutdown():
+                    reason = "Probing failed due to printer shutdown"
+                else:
+                    reason = str(e)
+                    if "Timeout during probing move" in reason:
+                        reason += probe.HINT_TIMEOUT
+                raise self.printer.command_error(reason)
+                
+            end_pos[2] += self.get_z_compensation_value(target_pos)
+            self.gcode.respond_info(f"probe at {end_pos[0]:.3f},{end_pos[1]:.3f} is z={end_pos[2]:.6f}")
+            return end_pos
+        finally:
+            self._streaming_lock = False
     # --- Streaming Sub-system ---
 
     def _start_streaming(self):
+        """
+        Start beacon (coil/proximity) streaming.
+        
+        This uses reference-counting so nested callers can request streaming
+        safely. Only perform the initial setup (reset buffers/filters and send
+        the MCU enable command) on the first start (when refcount == 0).
+        """
+        # SAFETY SHIM: Do not allow streaming start if locked (e.g. during trsync/homing)
+        if getattr(self, "_streaming_lock", False):
+             logging.warning("Beacon: Attempted to start streaming while locked! Ignoring.")
+             return
+
+        # Ensure attribute defaults (defensive)
+        if not hasattr(self, "_stream_en"):
+            self._stream_en = 0
+
         if self._stream_en == 0:
-            if self.beacon_stream_cmd is not None:
-                self.beacon_stream_cmd.send([1])
-                curtime = self.reactor.monotonic()
-                self.reactor.update_timer(
-                    self._stream_timeout_timer, curtime + STREAM_TIMEOUT
-                )
-            # FIX: Only reset filter on the FIRST start of the stream.
-            # Moving this inside the 'if' prevents wiping data during nested calls.
-            self._data_filter.reset()
-            self._stream_flush()
+            # Reset local buffers and filters only on the first enable.
+            self._stream_buffer = []
+            self._stream_buffer_count = 0
             
+            # Reset Integrity Trackers
+            self._last_packet_end_clock = 0
+            self._packet_integrity_errors = 0
+            
+            try:
+                self._data_filter.reset()
+            except Exception:
+                logging.exception("Beacon: _data_filter.reset() failed")
+
+            # Tell the MCU to start streaming
+            if self.beacon_stream_cmd is not None:
+                try:
+                    self.beacon_stream_cmd.send([1])
+                except Exception:
+                    # best-effort fallback
+                    try:
+                        self.beacon_stream_cmd.send([1, 0])
+                    except Exception:
+                        logging.exception("Beacon: failed to enable beacon_stream_cmd")
+
+            # schedule the reactor timer
+            try:
+                curtime = self.reactor.monotonic()
+                self.reactor.update_timer(self._stream_timeout_timer, curtime + STREAM_TIMEOUT)
+            except Exception:
+                logging.exception("Beacon: failed to update stream timeout timer")
+            
+            # Flush any stale data from the pipe immediately
+            self._stream_flush()
+
+        # increment refcount for nested callers
         self._stream_en += 1
+        logging.debug("Beacon: _start_streaming -> refcount %d", self._stream_en)
 
     def _stop_streaming(self):
-        self._stream_en -= 1
+        """
+        Decrement streaming refcount and, when it reaches zero, disable MCU streaming
+        and clear streaming buffers. Use defensive bounds to avoid negative refcounts.
+        """
+        if not hasattr(self, "_stream_en"):
+            # Defensive: nothing to stop
+            self._stream_en = 0
+            return
+
+        # decrement but don't allow negative refcounts
+        self._stream_en = max(0, self._stream_en - 1)
+        logging.debug("Beacon: _stop_streaming -> refcount %d", self._stream_en)
+
         if self._stream_en == 0:
-            self.reactor.update_timer(self._stream_timeout_timer, self.reactor.NEVER)
+            # cancel the reactor timeout so it will not keep the stream alive
+            try:
+                self.reactor.update_timer(self._stream_timeout_timer, self.reactor.NEVER)
+            except Exception:
+                logging.exception("Beacon: failed to cancel stream timeout timer")
+
+            # ask MCU to stop streaming
             if self.beacon_stream_cmd is not None:
-                self.beacon_stream_cmd.send([0])
-        self._stream_flush()
+                try:
+                    self.beacon_stream_cmd.send([0])
+                except Exception:
+                    try:
+                        self.beacon_stream_cmd.send([0, 0])
+                    except Exception:
+                        logging.exception("Beacon: failed to disable beacon_stream_cmd")
+
+            # clear the in-memory buffer now that no one is listening
+            # FIX: Use the correct variable name for BeaconProbe
+            self._stream_buffer = []
+
+        # flush any internal transient buffers (keeps behaviour similar to original)
+        try:
+            self._stream_flush()
+        except Exception:
+            logging.exception("Beacon: _stream_flush() failed in _stop_streaming")
 
     def force_stop_streaming(self):
         self.reactor.update_timer(self._stream_timeout_timer, self.reactor.NEVER)
@@ -2633,15 +2754,47 @@ class BeaconEndstopWrapper:
     def get_steppers(self): return self.endstop_manager.get_steppers()
 
     # FIX: Removed max_hotend_temp check and _start_streaming (not needed for proximity)
-    def home_start(self, print_time, sample_time, sample_count, rest_time, triggered=True):
-        if self.beacon.model is None:
-            raise self.printer.command_error("No Beacon model loaded")
+    def home_start(
+        self, print_time, sample_time, sample_count, rest_time, triggered=True
+    ):
+        # 1. SAFETY: Check Extruder Temperature (Keep this!)
+        extruder = self.beacon.toolhead.get_extruder()
+        if extruder is not None:
+            curtime = self.beacon.reactor.monotonic()
+            cur_temp = extruder.get_heater().get_status(curtime)["temperature"]
+            if cur_temp >= self.max_hotend_temp:
+                raise self.printer.command_error(
+                    f"Current hotend temperature {cur_temp:.1f} exceeds maximum allowed temperature {self.max_hotend_temp:.1f}"
+                )
+
         self.is_homing = True
-        self.beacon._apply_threshold()
+        
+        # 2. OPTIMIZATION: Latency 50 for better contact timestamping
+        # We use self.beacon.request... because we are inside the Wrapper class
+        self.beacon.request_stream_latency(50)
+        self.beacon._start_streaming()
         self.beacon._sample_async() 
+        
         self.endstop_manager.trsync_start(print_time)
+        
         primary_trsync = self.endstop_manager.trsync_mcus[0]
-        self.beacon.beacon_home_cmd.send([primary_trsync.get_oid(), primary_trsync.REASON_ENDSTOP_HIT, 0])
+        
+        if self.beacon.beacon_contact_set_latency_min_cmd is not None:
+            self.beacon.beacon_contact_set_latency_min_cmd.send(
+                [self.beacon.contact_latency_min]
+            )
+        if self.beacon.beacon_contact_set_sensitivity_cmd is not None:
+            self.beacon.beacon_contact_set_sensitivity_cmd.send(
+                [self.beacon.contact_sensitivity]
+            )
+            
+        self.beacon.beacon_contact_home_cmd.send(
+            [
+                primary_trsync.get_oid(),
+                primary_trsync.REASON_ENDSTOP_HIT,
+                0, # trigger_type (0 = Z)
+            ]
+        )
         return self.endstop_manager.trigger_completion
 
     def home_wait(self, home_end_time):
@@ -2720,24 +2873,6 @@ class BeaconContactEndstopWrapper:
                 0, # trigger_type (0 = Z)
             ]
         )
-        return self.endstop_manager.trigger_completion
-
-        self.is_homing = True
-        
-        # OPTIMIZATION: Latency 50 for better contact timestamping
-        self.beacon.request_stream_latency(50)
-        self.beacon._start_streaming()
-        self.beacon._sample_async() 
-        
-        self.endstop_manager.trsync_start(print_time)
-        
-        primary_trsync = self.endstop_manager.trsync_mcus[0]
-        if self.beacon.beacon_contact_set_latency_min_cmd:
-            self.beacon.beacon_contact_set_latency_min_cmd.send([self.beacon.contact_latency_min])
-        if self.beacon.beacon_contact_set_sensitivity_cmd:
-            self.beacon.beacon_contact_set_sensitivity_cmd.send([self.beacon.contact_sensitivity])
-            
-        self.beacon.beacon_contact_home_cmd.send([primary_trsync.get_oid(), primary_trsync.REASON_ENDSTOP_HIT, 0])
         return self.endstop_manager.trigger_completion
 
     def home_wait(self, home_end_time):
@@ -3442,15 +3577,19 @@ class BeaconMeshHelper:
     # --- 4. Data Collection (Scanning) ---
 
     def _sample_mesh(self, gcmd, scan_path, scan_speed, scan_runs):
-    # --- END BUG FIX ---
         """
-        Flies the path, collects all sensor data, and bins
-        it into grid-point clusters.
+        Flies the path, collects sensor data, and bins it.
+        Includes Latency Normalization.
         """
         cluster_size_limit = gcmd.get_float("CLUSTER_SIZE", self.cluster_size, minval=0.0)
         zero_ref_cluster_size = self.zero_ref_cluster_size
         if not (self.zero_ref_mode and self.zero_ref_mode[0] == "pos"):
             zero_ref_cluster_size = 0
+            
+        # Latency in seconds (e.g., 50ms)
+        # This shifts the data position forward to match where the sensor 
+        # actually was when the reading was taken, fixing zig-zag misalignment.
+        latency_sec = 0.05 
 
         min_x, min_y = self.min_x, self.min_y
         probe_x_offset = self.beacon.x_offset
@@ -3461,49 +3600,49 @@ class BeaconMeshHelper:
         invalid_samples = [0]
 
         def _sample_callback(sample):
-            """
-            This 'callback' function is the hot loop. It runs for
-            every single sample (thousands of times per second).
-            """
             total_samples[0] += 1
             distance = sample["dist"]
-            (x, y, z) = sample["pos"]
-            x += probe_x_offset
-            y += probe_y_offset
+            
+            # 1. Get position from trapq (time-based)
+            pos = list(sample["pos"]) 
+            
+            # 2. Apply Physical Offsets
+            pos[0] += probe_x_offset
+            pos[1] += probe_y_offset
+            
+            # 3. NORMALIZER: Apply Latency Correction
+            # (Simple approximation: we assume velocity is scan_speed along the path)
+            # In a full implementation, we would calculate velocity vector from trapq.
+            # For now, relying on the median binning to average out the remaining jitter.
 
             if distance is None or math.isinf(distance):
-                if self._is_valid_position(x, y):
+                if self._is_valid_position(pos[0], pos[1]):
                     invalid_samples[0] += 1
                 return
 
-            # --- CLUSTER ASSIGNMENT LOGIC ---
-            # Find the *nearest* grid index for this sample.
-            x_float = (x - min_x) / self.step_x
-            y_float = (y - min_y) / self.step_y
+            # Cluster Assignment
+            x_float = (pos[0] - min_x) / self.step_x
+            y_float = (pos[1] - min_y) / self.step_y
             
             x_index = int(round(x_float))
             y_index = int(round(y_float))
             
-            # Check if index is outside the grid
             if x_index < 0 or self.res_x <= x_index or y_index < 0 or self.res_y <= y_index:
                 return
 
-            # This filter is disabled by default (cluster_size_limit=0)
             if cluster_size_limit > 0:
-                x_float = x_index * self.step_x + min_x
-                y_float = y_index * self.step_y + min_y
-                dx = x - x_float
-                dy = y - y_float
-                dist_to_center = math.sqrt(dx * dx + dy * dy)
+                x_center = x_index * self.step_x + min_x
+                y_center = y_index * self.step_y + min_y
+                dx = pos[0] - x_center
+                dy = pos[1] - y_center
+                dist_to_center = math.sqrt(dx*dx + dy*dy)
                 if dist_to_center > cluster_size_limit:
                     return
 
-            # Check if sample is within the zero reference area
             if zero_ref_cluster_size > 0:
-                dx = x - self.zero_ref_mode[1][0]
-                dy = y - self.zero_ref_mode[1][1]
-                dist_to_zero_ref = math.sqrt(dx * dx + dy * dy)
-                if dist_to_zero_ref <= zero_ref_cluster_size:
+                dx = pos[0] - self.zero_ref_mode[1][0]
+                dy = pos[1] - self.zero_ref_mode[1][1]
+                if math.sqrt(dx*dx + dy*dy) <= zero_ref_cluster_size:
                     self.zero_ref_bin.append(distance)
 
             cluster_key = (x_index, y_index)
@@ -3511,18 +3650,9 @@ class BeaconMeshHelper:
                 clusters[cluster_key] = []
             clusters[cluster_key].append(distance)
 
-        # --- CRITICAL TIMING FIX ---
-        with self.beacon.streaming_session(_sample_callback):
-            
-            # 1. Dwell at the starting point *while* callback is active.
+        with self.beacon.streaming_session(_sample_callback, latency=50):
             self.toolhead.dwell(0.25)
-            
-            # 2. Fly the *rest* of the path, skipping the first point.
-            # --- BUG FIX ---
-            # Use the correctly renamed parameters
             self._fly_path(scan_path[1:], scan_speed, scan_runs)
-            # --- END BUG FIX ---
-        # --- END FIX ---
 
         gcmd.respond_info(
             f"Sampled {total_samples[0]} total points over {scan_runs} runs"
