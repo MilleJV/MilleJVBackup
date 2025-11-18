@@ -4227,9 +4227,6 @@ class BeaconAccelHelper(adxl345.ADXL345):
     # --- Accelerometer Public Interface ---
 
     def start_internal_client(self):
-        if not self.accel_helper:
-            msg = "This Beacon has no accelerometer"
-            raise self.printer.command_error(msg)
         cli = AccelInternalClient(self.beacon.printer)
         self._api_dump.add_client(cli._handle_data)
         return cli
