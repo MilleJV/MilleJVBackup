@@ -1036,48 +1036,81 @@ class BeaconProbe:
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
     def cmd_BEACON_OFFSET_COMPARE(self, gcmd):
         start_pos = self.toolhead.get_position()
+        num_samples = gcmd.get_int("SAMPLES", 1)
         
-        # 1. Move to Safe Z
+        # 1. Move to Safe Z (10mm)
         self.toolhead.manual_move([None, None, 10.0], 50.0)
         self.toolhead.wait_moves()
 
-        # 2. Perform Contact Probe
-        gcmd.respond_info("Probing with Contact (Speed 3.0)...")
-        self.mcu_contact_probe.activate_gcode.run_gcode_from_command()
-        try:
-            hmove = HomingMove(self.printer, [(self.mcu_contact_probe, "contact")])
-            # FIX: Must pass current X/Y coordinates to homing_move
-            target_pos = [start_pos[0], start_pos[1], -2.0]
-            epos = hmove.homing_move(target_pos, 3.0, probe_pos=True) 
-            contact_z = epos[2]
-        finally:
-            self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
+        deltas = []
 
-        gcmd.respond_info(f"Contact trigger at Z={contact_z:.5f}")
+        for i in range(num_samples):
+            # 2. Perform Contact Probe (Speed 3.0)
+            # We only log the "Probing..." message once to keep console clean, or on every step if multiple
+            if num_samples == 1:
+                gcmd.respond_info("Probing with Contact (Speed 3.0)...")
+            else:
+                gcmd.respond_info(f"Offset Compare Sample {i+1}/{num_samples}")
 
-        # 3. Retract and measure
-        measure_z = contact_z + 3.0
-        self.toolhead.manual_move([None, None, measure_z], 10.0)
-        self.toolhead.wait_moves()
-        self.toolhead.dwell(0.5)
-        
-        # 4. Measure Proximity
-        # Note: We rely on _sample's internal stream handling here since it's a single shot
-        (dist, samples) = self._sample(self.z_settling_time, 50) 
-        
-        proximity_z = measure_z - dist 
-        delta = contact_z - proximity_z 
-        
-        gcmd.respond_info(
-            f"Comparing @ {epos[0]:.4f},{epos[1]:.4f}\n"
-            f"Contact:   {contact_z:.5f} mm\n"
-            f"Proximity: {proximity_z:.5f} mm\n"
-            f"Delta:     {delta * 1000.0:.3f} um"
-        )
+            self.mcu_contact_probe.activate_gcode.run_gcode_from_command()
+            try:
+                hmove = HomingMove(self.printer, [(self.mcu_contact_probe, "contact")])
+                # Pass current X/Y to avoid the TypeError crash
+                target_pos = [start_pos[0], start_pos[1], -2.0]
+                epos = hmove.homing_move(target_pos, 3.0, probe_pos=True) 
+                contact_z = epos[2]
+            finally:
+                self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
+
+            # 3. Retract and measure
+            # Move up 3mm relative to where we just touched
+            measure_z = contact_z + 3.0
+            self.toolhead.manual_move([None, None, measure_z], 10.0)
+            self.toolhead.wait_moves()
+            self.toolhead.dwell(0.5)
+            
+            # 4. Measure Proximity
+            # Standard 50ms latency for accuracy
+            self.request_stream_latency(50)
+            self._start_streaming()
+            (dist, samples) = self._sample(self.z_settling_time, 50)
+            self._stop_streaming()
+            self.drop_stream_latency_request(50)
+            
+            proximity_z = measure_z - dist 
+            delta = contact_z - proximity_z 
+            deltas.append(delta)
+            
+            gcmd.respond_info(
+                f"Sample {i+1}: Contact={contact_z:.5f}, Proximity={proximity_z:.5f}, Delta={delta * 1000.0:.3f} um"
+            )
+            
+            # If looping, we are already at 'measure_z' (Contact + 3mm).
+            # This is a safe height to start the next Contact probe from.
+
+        # Stats
+        if num_samples > 1:
+            avg_delta = np.mean(deltas)
+            median_delta = median(deltas)
+            sd_delta = np.std(deltas)
+            range_delta = max(deltas) - min(deltas)
+            
+            gcmd.respond_info(
+                f"Offset Compare Results ({num_samples} samples):\n"
+                f"Mean Delta:   {avg_delta * 1000.0:.3f} um\n"
+                f"Median Delta: {median_delta * 1000.0:.3f} um\n"
+                f"Std Dev:      {sd_delta * 1000.0:.3f} um\n"
+                f"Range:        {range_delta * 1000.0:.3f} um"
+            )
         
         # 5. Cleanup
         gcmd.respond_info("Test complete. Cleaning up...")
+        # Move Z up to safe 10mm
         self.toolhead.manual_move([None, None, 10.0], 50.0)
+        # Move X/Y back to start
+        self.toolhead.manual_move([start_pos[0], start_pos[1], None], 50.0)
+        self.toolhead.wait_moves()
+        # Re-home for safety
         self.gcode.run_script_from_command("G28")
 
     # --- Core Probing Logic ---
