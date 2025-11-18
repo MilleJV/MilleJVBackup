@@ -1878,11 +1878,11 @@ class BeaconProbe:
         # and other Klipper modules. They delegate the calls
         # to the internal BeaconAccelHelper instance.
 
+    # Inside class BeaconProbe (Line ~1880)
     def start_internal_client(self):
-        # Logic check removed because we are already inside the helper
-        cli = AccelInternalClient(self.beacon.printer)
-        self._api_dump.add_client(cli._handle_data)
-        return cli
+        if not self.accel_helper:
+            raise self.gcode.error(f"'{self.name}' is not an accelerometer")
+        return self.accel_helper.start_internal_client()
 
     def is_measuring(self):
         if not self.accel_helper:
@@ -2650,11 +2650,45 @@ class BeaconContactEndstopWrapper:
     def home_start(
         self, print_time, sample_time, sample_count, rest_time, triggered=True
     ):
-        # ... (extruder temp check) ...
+        # 1. SAFETY: Check Extruder Temperature (Keep this!)
+        extruder = self.beacon.toolhead.get_extruder()
         if extruder is not None:
-            # ...
+            curtime = self.beacon.reactor.monotonic()
+            cur_temp = extruder.get_heater().get_status(curtime)["temperature"]
             if cur_temp >= self.max_hotend_temp:
-                 # ...
+                raise self.printer.command_error(
+                    f"Current hotend temperature {cur_temp:.1f} exceeds maximum allowed temperature {self.max_hotend_temp:.1f}"
+                )
+
+        self.is_homing = True
+        
+        # 2. OPTIMIZATION: Latency 50 for better contact timestamping
+        # We use self.beacon.request... because we are inside the Wrapper class
+        self.beacon.request_stream_latency(50)
+        self.beacon._start_streaming()
+        self.beacon._sample_async() 
+        
+        self.endstop_manager.trsync_start(print_time)
+        
+        primary_trsync = self.endstop_manager.trsync_mcus[0]
+        
+        if self.beacon.beacon_contact_set_latency_min_cmd is not None:
+            self.beacon.beacon_contact_set_latency_min_cmd.send(
+                [self.beacon.contact_latency_min]
+            )
+        if self.beacon.beacon_contact_set_sensitivity_cmd is not None:
+            self.beacon.beacon_contact_set_sensitivity_cmd.send(
+                [self.beacon.contact_sensitivity]
+            )
+            
+        self.beacon.beacon_contact_home_cmd.send(
+            [
+                primary_trsync.get_oid(),
+                primary_trsync.REASON_ENDSTOP_HIT,
+                0, # trigger_type (0 = Z)
+            ]
+        )
+        return self.endstop_manager.trigger_completion
 
         self.is_homing = True
         
@@ -4242,6 +4276,7 @@ class BeaconAccelHelper(adxl345.ADXL345):
     # --- Accelerometer Public Interface ---
 
     def start_internal_client(self):
+        # Fix: Removed the "if not self.accel_helper" check
         cli = AccelInternalClient(self.beacon.printer)
         self._api_dump.add_client(cli._handle_data)
         return cli
