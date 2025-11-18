@@ -626,7 +626,7 @@ class BeaconProbe:
 
     cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
-        # FIX: Overrun 0.5 and Z 1.5 ensures 1.0mm clearance (Safety check > 0.5)
+        # FIX: Changed defaults to Z=1.5 and Overrun=0.5 so (1.5 - 0.5 = 1.0) > 0.5 safety limit
         overrun = gcmd.get_float("OVERRUN", 0.5)
         target_z_dist = gcmd.get_float("Z", 1.5)
         num_samples = gcmd.get_int("SAMPLES", 20)
@@ -1452,15 +1452,16 @@ class BeaconProbe:
     # --- Streaming Sub-system ---
 
     def _start_streaming(self):
-        if self._stream_en == 0: 
-            # Only send command and reset filter if stream isn't already running
+        if self._stream_en == 0:
             if self.beacon_stream_cmd is not None:
                 self.beacon_stream_cmd.send([1])
                 curtime = self.reactor.monotonic()
                 self.reactor.update_timer(
                     self._stream_timeout_timer, curtime + STREAM_TIMEOUT
                 )
-            self._data_filter.reset() # <--- MOVED INSIDE THE IF BLOCK
+            # FIX: Only reset filter on the FIRST start of the stream.
+            # Moving this inside the 'if' prevents wiping data during nested calls.
+            self._data_filter.reset()
             self._stream_flush()
             
         self._stream_en += 1
