@@ -651,7 +651,7 @@ class BeaconProbe:
         self.gcode.run_script_from_command("G28")
         
         # 2. Move to Safe Z
-        self.toolhead.manual_move([None, None, 2.0], fast_speed)
+        self.toolhead.manual_move([None, None, 10.0], fast_speed)
         self.toolhead.wait_moves()
         
         # 3. Move to Z_Start_test
@@ -1022,7 +1022,7 @@ class BeaconProbe:
             self.toolhead.manual_move([None, None, 5.0], self.lift_speed)
             self.toolhead.wait_moves()
             
-            # FIX: Correctly pass X/Y to prevent NoneType crash
+            # FIX: Get current X/Y to avoid NoneType crash
             cur_pos = self.toolhead.get_position()
             self.toolhead.set_position([cur_pos[0], cur_pos[1], 5.0 - z_zero])
             
@@ -1034,10 +1034,8 @@ class BeaconProbe:
         
         # FIX: Final Park & Home Sequence
         gcmd.respond_info("Auto Calibration complete. Parking...")
-        
-        # 1. Move Z to 10mm 
+        # 1. Move Z to 10mm at 30mm/s
         self.toolhead.manual_move([None, None, 10.0], 30.0)
-        
         # 2. Move XY to 0,0 at 30mm/s
         self.toolhead.manual_move([0.0, 0.0, None], 30.0)
         self.toolhead.wait_moves()
@@ -1463,8 +1461,9 @@ class BeaconProbe:
                 self.reactor.update_timer(
                     self._stream_timeout_timer, curtime + STREAM_TIMEOUT
                 )
-            # FIX: Only reset filter when starting a NEW stream
-            # This prevents data from being zeroed out during nested calls (e.g. inside _sample)
+            # FIX: Only reset filter on the FIRST start of the stream.
+            # Resetting it on nested calls (count > 0) wipes valid data 
+            # and causes the "sensor not receiving data" or "-inf" errors.
             self._data_filter.reset()
             self._stream_flush()
         self._stream_en += 1
