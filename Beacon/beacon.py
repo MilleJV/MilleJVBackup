@@ -626,10 +626,9 @@ class BeaconProbe:
 
     cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
-        # FIX: Adjusted defaults to satisfy safety check (1.5 - 0.5 = 1.0 > 0.5)
+        # FIX: Overrun 0.5 and Z 1.5 ensures 1.0mm clearance (Safety check > 0.5)
         overrun = gcmd.get_float("OVERRUN", 0.5)
         target_z_dist = gcmd.get_float("Z", 1.5)
-        
         num_samples = gcmd.get_int("SAMPLES", 20)
         sample_count_per_read = 50
         settle_time = self.z_settling_time
@@ -1023,7 +1022,7 @@ class BeaconProbe:
             self.toolhead.manual_move([None, None, 5.0], self.lift_speed)
             self.toolhead.wait_moves()
             
-            # Set position to Contact Z (fixes crash)
+            # FIX: Correctly pass X/Y to prevent NoneType crash
             cur_pos = self.toolhead.get_position()
             self.toolhead.set_position([cur_pos[0], cur_pos[1], 5.0 - z_zero])
             
@@ -1033,17 +1032,22 @@ class BeaconProbe:
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
         
-        # Cleanup: Just lift Z and Home
-        gcmd.respond_info("Auto Calibration complete. Homing...")
+        # FIX: Final Park & Home Sequence
+        gcmd.respond_info("Auto Calibration complete. Parking...")
+        
+        # 1. Move Z to 10mm 
         self.toolhead.manual_move([None, None, 10.0], 30.0)
+        
+        # 2. Move XY to 0,0 at 30mm/s
+        self.toolhead.manual_move([0.0, 0.0, None], 30.0)
         self.toolhead.wait_moves()
-        # Force proximity homing to prevent infinite loops
+        
+        # 3. Home using PROXIMITY to prevent infinite contact-homing loop
         self.gcode.run_script_from_command("G28 METHOD=proximity")
 
     cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
-    cmd_BEACON_OFFSET_COMPARE_help = "Compare contact and proximity offsets"
     def cmd_BEACON_OFFSET_COMPARE(self, gcmd):
-        # 1. Homing Check (CRITICAL FIX)
+        # 1. Homing Check
         curtime = self.reactor.monotonic()
         kin_status = self.kinematics.get_status(curtime)
         if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"] or "z" not in kin_status["homed_axes"]:
@@ -1051,6 +1055,7 @@ class BeaconProbe:
              self.gcode.run_script_from_command("G28")
 
         start_pos = self.toolhead.get_position()
+        # Use config value (default 2)
         num_samples = gcmd.get_int("SAMPLES", self.offset_compare_samples)
         
         # 2. Move to Safe Z (2.0mm)
@@ -1451,15 +1456,18 @@ class BeaconProbe:
     # --- Streaming Sub-system ---
 
     def _start_streaming(self):
-        if self._stream_en == 0 and self.beacon_stream_cmd is not None:
-            self.beacon_stream_cmd.send([1])
-            curtime = self.reactor.monotonic()
-            self.reactor.update_timer(
-                self._stream_timeout_timer, curtime + STREAM_TIMEOUT
-            )
+        if self._stream_en == 0:
+            if self.beacon_stream_cmd is not None:
+                self.beacon_stream_cmd.send([1])
+                curtime = self.reactor.monotonic()
+                self.reactor.update_timer(
+                    self._stream_timeout_timer, curtime + STREAM_TIMEOUT
+                )
+            # FIX: Only reset filter when starting a NEW stream
+            # This prevents data from being zeroed out during nested calls (e.g. inside _sample)
+            self._data_filter.reset()
+            self._stream_flush()
         self._stream_en += 1
-        self._data_filter.reset()
-        self._stream_flush()
 
     def _stop_streaming(self):
         self._stream_en -= 1
