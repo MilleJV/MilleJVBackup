@@ -1884,6 +1884,21 @@ class BeaconProbe:
         self._api_dump.add_client(cli._handle_data)
         return cli
 
+    def is_measuring(self):
+        if not self.accel_helper:
+            return False
+        return self.accel_helper.is_measuring()
+
+    def read_reg(self, reg):
+        if not self.accel_helper:
+            raise self.gcode.error(f"'{self.name}' is not an accelerometer")
+        return self.accel_helper.read_reg(reg)
+
+    def set_reg(self, reg, val, minclock=0):
+        if not self.accel_helper:
+            raise self.gcode.error(f"'{self.name}' is not an accelerometer")
+        return self.accel_helper.set_reg(reg, val, minclock)
+
 
 class BeaconModel:
     """
