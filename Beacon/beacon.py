@@ -632,91 +632,81 @@ class BeaconProbe:
         approach_buffer = 0.5
         creep_speed = 3.0
         dwell_time = 1.0
+        backlash_clearance = 2.0
         
-        # Speeds (from config logic ideally, but safe defaults here)
-        fast_speed = 100.0  # For Safe Z
-        cycle_speed = 30.0  # For positioning
+        fast_speed = 100.0
+        cycle_speed = 30.0
 
-        # 1. Safety Check
         if target_z_dist - overrun < 0.5:
             raise gcmd.error(
-                f"Test target ({target_z_dist}) minus overrun ({overrun}) is too close to bed! "
-                "Decrease OVERRUN or increase Z."
+                f"Test target ({target_z_dist}) minus overrun ({overrun}) is too close to bed!"
             )
 
-        # 2. Home (Mandatory for Delta safety)
+        # 1. Home
         gcmd.respond_info("Homing...")
         self.gcode.run_script_from_command("G28")
         
-        # 3. Move to Safe Z
+        # 2. Move to Safe Z
         self.toolhead.manual_move([None, None, 10.0], fast_speed)
         self.toolhead.wait_moves()
-
-        # 4. Baseline Measure (Down Approach)
-        start_pos_z = target_z_dist + overrun
-        gcmd.respond_info(f"Moving to start position Z={start_pos_z:.3f}")
-        self.toolhead.manual_move([None, None, start_pos_z], cycle_speed)
         
-        # Creep down to target
-        self.toolhead.manual_move([None, None, target_z_dist], 1.0)
+        # 3. Baseline Measure
+        gcmd.respond_info("Taking baseline measurement...")
+        self.toolhead.manual_move([None, None, target_z_dist], 1.0) 
         self.toolhead.wait_moves()
         self.toolhead.dwell(1.0)
         
-        # Measure Baseline
-        self.request_stream_latency(50)
-        self._start_streaming()
-        (baseline_dist, _) = self._sample(0, sample_count_per_read)
-        self._stop_streaming()
-        self.drop_stream_latency_request(50)
+        # Measure Baseline (Safe single sample)
+        (baseline_dist, _) = self._sample(settle_time, sample_count_per_read)
         
-        # Calculate machine Z for the target distance
         target_kin_z = self.toolhead.get_position()[2]
         gcmd.respond_info(f"Baseline: {baseline_dist:.5f} at Machine Z: {target_kin_z:.4f}")
 
         samples_down = []
         samples_up = []
 
+        # 4. Test Loop with Continuous Stream
+        # We keep the stream open to avoid start/stop instability
+        self.request_stream_latency(50)
+        self._start_streaming()
+        
         try:
+            # Dummy callback to keep stream alive
+            def no_op(s): pass
+            
+            # Create a session context but we won't use 'with' for the loop to avoid nesting issues
+            # We just rely on the manual start above and _sample's ability to piggyback
+            
             for i in range(num_samples):
-                # --- DOWN SAMPLE (Approach from Above) ---
-                # 1. Move Up to Start
+                # --- DOWN SAMPLE ---
+                # Move Up (Clearance)
                 up_pos = target_kin_z + overrun
                 self.toolhead.manual_move([None, None, up_pos], cycle_speed)
                 
-                # 2. Approach (Stream ON)
-                self.request_stream_latency(50)
-                self._start_streaming()
+                # Approach Down
                 self.toolhead.manual_move([None, None, target_kin_z], creep_speed)
                 self.toolhead.wait_moves()
                 self.toolhead.dwell(dwell_time)
                 
-                # 3. Measure
+                # Measure (0 skip because we dwelled)
                 (dist_down, _) = self._sample(0, sample_count_per_read)
                 samples_down.append(dist_down)
                 
-                # 4. Stop Stream
-                self._stop_streaming()
-                self.drop_stream_latency_request(50)
-
-                # --- UP SAMPLE (Approach from Below) ---
-                # 1. Move Down to Low Start
+                # --- UP SAMPLE ---
+                # Move Down (Clearance) - Careful with bed!
                 low_pos = target_kin_z - overrun
+                # Safety clamp
+                if low_pos < 0.1: low_pos = 0.1
                 self.toolhead.manual_move([None, None, low_pos], cycle_speed)
                 
-                # 2. Approach Up (Stream ON)
-                self.request_stream_latency(50)
-                self._start_streaming()
+                # Approach Up
                 self.toolhead.manual_move([None, None, target_kin_z], creep_speed)
                 self.toolhead.wait_moves()
                 self.toolhead.dwell(dwell_time)
                 
-                # 3. Measure
+                # Measure
                 (dist_up, _) = self._sample(0, sample_count_per_read)
                 samples_up.append(dist_up)
-                
-                # 4. Stop Stream
-                self._stop_streaming()
-                self.drop_stream_latency_request(50)
 
                 diff = dist_up - dist_down
                 gcmd.respond_info(
@@ -724,10 +714,11 @@ class BeaconProbe:
                 )
 
         finally:
+            # 5. Stop Stream
             self._stop_streaming()
             self.drop_stream_latency_request(50)
 
-        # 5. Finish
+        # 6. Finish
         self.toolhead.manual_move([None, None, 10.0], fast_speed)
         self.gcode.run_script_from_command("G28")
 
@@ -961,18 +952,17 @@ class BeaconProbe:
         tolerance = gcmd.get_float("SAMPLES_TOLERANCE", self.autocal_tolerance, above=0.0)
         max_retries = gcmd.get_int("SAMPLES_TOLERANCE_RETRIES", self.autocal_max_retries, minval=0)
         
-        # FIX: Set calibration speed correctly for the magnetic scan later
         self.cal_speed = speed
         
-        # 1. Home if needed
         curtime = self.reactor.monotonic()
         kin_status = self.kinematics.get_status(curtime)
+        
         if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"] or "z" not in kin_status["homed_axes"]:
              gcmd.respond_info("Printer not homed. Homing now...")
              self.gcode.run_script_from_command("G28")
         
-        # 2. Move to safe Z start (Fast)
-        self.toolhead.manual_move([None, None, 10.0], self.lift_speed)
+        # Fast Move to Safe Z
+        self.toolhead.manual_move([None, None, 10.0], 100.0)
         self.toolhead.wait_moves()
 
         home_pos = self.toolhead.get_position()
@@ -1000,7 +990,6 @@ class BeaconProbe:
                 
                 try:
                     hmove = HomingMove(self.printer, [(self.mcu_contact_probe, "contact")])
-                    # Approach at user requested speed
                     epos = hmove.homing_move(home_pos, speed, probe_pos=True)
                 except self.printer.command_error:
                     if self.printer.is_shutdown(): raise self.printer.command_error("Homing failed due to printer shutdown")
@@ -1008,7 +997,6 @@ class BeaconProbe:
                 finally:
                     set_max_accel(old_max_accel)
                 
-                # Retract
                 retract_pos = self.toolhead.get_position()[:]
                 retract_pos[2] += retract_dist
                 self.toolhead.move(retract_pos, retract_speed)
@@ -1017,7 +1005,6 @@ class BeaconProbe:
                 if not skip_next:
                     stop_samples.append(epos[2])
                     mean = np.mean(stop_samples)
-                    # Fix SD calculation (needs at least 2 points)
                     sd = np.std(stop_samples) if len(stop_samples) > 1 else 0.0
                     
                     delta = max([abs(v - mean) for v in stop_samples])
@@ -1029,15 +1016,15 @@ class BeaconProbe:
                         retries += 1
                         skip_next = True
                     else:
-                         gcmd.respond_info(f"Sample collected. Mean: {mean:.5f}, SD: {sd:.5f}")
+                         if len(stop_samples) > 1:
+                             gcmd.respond_info(f"Sample collected. Mean: {mean:.5f}, SD: {sd:.5f}")
                 else:
                     skip_next = False
 
             z_zero = np.mean(stop_samples)
             gcmd.respond_info(f"Contact zero found at {z_zero:.5f}")
             
-            # Move UP to 5mm for scan
-            self.toolhead.manual_move([None, None, 5.0], self.lift_speed)
+            self.toolhead.manual_move([None, None, 5.0], 100.0)
             self.toolhead.wait_moves()
             
             self.toolhead.set_position([None, None, 5.0 - z_zero])
@@ -1054,12 +1041,14 @@ class BeaconProbe:
         self.toolhead.manual_move([None, None, 10.0], 50.0)
         self.toolhead.wait_moves()
 
-        # 2. Perform Contact Probe (Speed 3.0)
+        # 2. Perform Contact Probe
         gcmd.respond_info("Probing with Contact (Speed 3.0)...")
         self.mcu_contact_probe.activate_gcode.run_gcode_from_command()
         try:
             hmove = HomingMove(self.printer, [(self.mcu_contact_probe, "contact")])
-            epos = hmove.homing_move([None, None, -2.0], 3.0, probe_pos=True) 
+            # FIX: Must pass current X/Y coordinates to homing_move
+            target_pos = [start_pos[0], start_pos[1], -2.0]
+            epos = hmove.homing_move(target_pos, 3.0, probe_pos=True) 
             contact_z = epos[2]
         finally:
             self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
@@ -1072,13 +1061,9 @@ class BeaconProbe:
         self.toolhead.wait_moves()
         self.toolhead.dwell(0.5)
         
-        # 4. Measure (Crash Fix: No streaming_session wrapper)
-        # Manually request latency if desired, though _sample defaults are usually fine
-        self.request_stream_latency(50)
-        self._start_streaming()
+        # 4. Measure Proximity
+        # Note: We rely on _sample's internal stream handling here since it's a single shot
         (dist, samples) = self._sample(self.z_settling_time, 50) 
-        self._stop_streaming()
-        self.drop_stream_latency_request(50)
         
         proximity_z = measure_z - dist 
         delta = contact_z - proximity_z 
@@ -1093,8 +1078,6 @@ class BeaconProbe:
         # 5. Cleanup
         gcmd.respond_info("Test complete. Cleaning up...")
         self.toolhead.manual_move([None, None, 10.0], 50.0)
-        self.toolhead.manual_move([start_pos[0], start_pos[1], None], 50.0)
-        self.toolhead.wait_moves()
         self.gcode.run_script_from_command("G28")
 
     # --- Core Probing Logic ---
