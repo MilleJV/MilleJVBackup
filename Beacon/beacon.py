@@ -631,42 +631,36 @@ class BeaconProbe:
         num_samples = gcmd.get_int("SAMPLES", 20)
         settle_time = self.z_settling_time
         
-        # High-accuracy settings for the final approach
-        approach_buffer = 0.5 
-        approach_speed = 3.0 # Extremely slow final move for accuracy
-        approach_dwell = 0.5 # Wait for mechanics to settle
+        # 1. Define "Creep" parameters for the final approach
+        approach_buffer = 0.5       # Start streaming 0.5mm away
+        creep_speed = 3.0           # Extremely slow final move for accuracy
+        dwell_time = 0.5            # Dwell before measuring
 
         # --- SAFETY FIX: Delta Specific Start Position ---
         cur_kin_z = self.toolhead.get_position()[2]
         
-        # Use the robust self.is_delta flag (set in __init__)
         if self.is_delta:
             kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
             max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
             
-            # Safe height: Target + Overrun + 5mm buffer
             safe_start_z = target_z_dist + overrun + 5.0
 
-            # If we are too high (near home) or just above the safety buffer:
             if cur_kin_z + overrun > max_z or cur_kin_z > safe_start_z:
-                gcmd.respond_info(f"Delta Kinematics detected. Moving to safe Z: {safe_start_z:.2f}mm")
+                gcmd.respond_info(f"Delta detected. Moving to safe Z: {safe_start_z:.2f}mm")
                 self.toolhead.manual_move([None, None, safe_start_z], speed)
                 self.toolhead.wait_moves()
                 cur_kin_z = safe_start_z
         # -----------------------------------------------
 
-        # Perform the initial backlash clearing move (UP)
-        # We do this blindly (no stream) to save CPU
+        # Perform the initial backlash clearing move (Stream OFF)
         self.toolhead.manual_move([None, None, cur_kin_z + overrun], speed)
-        
-        # Probe once to establish a baseline target
         self.run_probe(gcmd) 
 
         samples_up = []
         samples_down = []
         next_dir = -1 
         
-        # Calculate the Machine Z target based on the probe we just did
+        # Calculate the Machine Z target
         (current_dist, _samples) = self._sample(settle_time, 10)
         current_pos = self.toolhead.get_position()
         missing_dist = target_z_dist - current_dist
@@ -680,31 +674,31 @@ class BeaconProbe:
             while len(samples_up) + len(samples_down) < num_samples:
                 
                 # 1. Move to the "Overrun" position (Far away) - STREAM OFF
-                # Faster move to get near the point
                 start_pos_z = target_kin_z + (overrun * next_dir * -1)
                 self.toolhead.manual_move([None, None, start_pos_z], lift_speed)
                 
-                # 2. Move to the "Approach" position - STREAM OFF
-                # This puts us 0.5mm away from the target
+                # 2. Move to "Approach" start (0.5mm away) - STREAM OFF
                 approach_start_z = target_kin_z + (approach_buffer * next_dir * -1)
                 self.toolhead.manual_move([None, None, approach_start_z], lift_speed)
                 self.toolhead.wait_moves()
 
-                # 3. Enable Stream for final approach
-                self.beacon.request_stream_latency(50) 
+                # 3. Enable Stream for final creep
+                self.request_stream_latency(50) 
                 self._start_streaming()
                 
-                # 4. Final Approach Move (0.5mm) - Super Slow & Accurate
-                self.toolhead.manual_move([None, None, target_kin_z], approach_speed)
+                # 4. Final Creep Move (3mm/s)
+                self.toolhead.manual_move([None, None, target_kin_z], creep_speed)
                 self.toolhead.wait_moves()
-                self.toolhead.dwell(approach_dwell) # Wait for mechanics to settle
                 
-                # 5. Measure
+                # 5. Dwell
+                self.toolhead.dwell(dwell_time)
+                
+                # 6. Measure
                 (dist, _samples) = self._sample(settle_time, 10)
                 
-                # 6. Disable Stream immediately
+                # 7. Disable Stream
                 self._stop_streaming()
-                self.beacon.drop_stream_latency_request(50)
+                self.drop_stream_latency_request(50)
                 
                 if next_dir == -1:
                     samples_up.append(dist)
@@ -715,7 +709,7 @@ class BeaconProbe:
 
         finally:
             self._stop_streaming()
-            self.beacon.drop_stream_latency_request(50)
+            self.drop_stream_latency_request(50)
 
         res_up = median(samples_up)
         res_down = median(samples_down)
@@ -879,7 +873,11 @@ class BeaconProbe:
                     )
                     f.write(log_line)
 
-                # OPTIMIZATION: latency=100 drastically reduces CPU interrupts
+                # CRITICAL FIX: Explicitly manage stream latency for Contact move
+                self.request_stream_latency(100)
+                self._start_streaming()
+
+                # Poke sequence: Starts stream, then moves, then stops stream
                 with self.streaming_session(_poke_stream_callback, latency=100):
                     self._sample_async()
                     self.toolhead.get_last_move_time()
@@ -921,6 +919,10 @@ class BeaconProbe:
                         self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
                         self.toolhead.manual_move([None, None, top], 100.0)
                         self.toolhead.wait_moves()
+                        # Clean up the manual streaming requested by Poke
+                        self._stop_streaming()
+                        self.drop_stream_latency_request(100)
+
         except OSError as e:
             gcmd.respond_info(f"Warning: Could not write poke data to {filename}: {e}")
 
@@ -1323,7 +1325,7 @@ class BeaconProbe:
         
         target_z = self.trigger_distance
         
-        # FIX: Use manual_move for Delta to avoid CPU overload during streaming
+        # FIX: Deltas crash if we use the heavy 'probing_move' while streaming.
         if self.is_delta:
              self.toolhead.manual_move([None, None, target_z], speed)
              self.toolhead.wait_moves()
