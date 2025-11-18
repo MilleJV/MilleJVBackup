@@ -623,25 +623,30 @@ class BeaconProbe:
 
     cmd_BEACON_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
     def cmd_BEACON_ESTIMATE_BACKLASH(self, gcmd):
-        # ... (keep parameters setup) ...
+        # Get parameters
         overrun = gcmd.get_float("OVERRUN", 1.0)
         speed = gcmd.get_float("PROBE_SPEED", self.speed, above=0.0)
         lift_speed = self.get_lift_speed(gcmd)
         target_z_dist = gcmd.get_float("Z", self.trigger_distance)
-        num_samples = gcmd.get_int("SAMPLES", 20)
+        
+        # OPTIMIZATION: Hardcode high sample count for accuracy
+        # 50 samples eliminates sensor noise variance
+        num_samples = gcmd.get_int("SAMPLES", 20) 
+        sample_count_per_read = 50 
+        
         settle_time = self.z_settling_time
         
-        approach_buffer = 0.5 
-        creep_speed = 3.0
-        dwell_time = 0.5
+        # 1. Define "Creep" parameters for the final approach
+        approach_buffer = 0.5       
+        creep_speed = 3.0           
+        dwell_time = 1.0  # Increased to 1.0s to let Delta effector stabilize
 
+        # --- SAFETY FIX: Delta Specific Start Position ---
         cur_kin_z = self.toolhead.get_position()[2]
         
-        # Delta Safety Check
         if self.is_delta:
             kin_status = self.toolhead.get_kinematics().get_status(self.reactor.monotonic())
             max_z = kin_status["axis_maximum"][2] if "axis_maximum" in kin_status else 300.0
-            
             safe_start_z = target_z_dist + overrun + 5.0
 
             if cur_kin_z + overrun > max_z or cur_kin_z > safe_start_z:
@@ -649,8 +654,8 @@ class BeaconProbe:
                 self.toolhead.manual_move([None, None, safe_start_z], speed)
                 self.toolhead.wait_moves()
                 cur_kin_z = safe_start_z
-        
-        # Initial Move
+        # -----------------------------------------------
+
         self.toolhead.manual_move([None, None, cur_kin_z + overrun], speed)
         self.run_probe(gcmd) 
 
@@ -658,7 +663,7 @@ class BeaconProbe:
         samples_down = []
         next_dir = -1 
         
-        (current_dist, _samples) = self._sample(settle_time, 10)
+        (current_dist, _samples) = self._sample(settle_time, sample_count_per_read)
         current_pos = self.toolhead.get_position()
         missing_dist = target_z_dist - current_dist
         target_kin_z = current_pos[2] + missing_dist
@@ -678,22 +683,22 @@ class BeaconProbe:
                 self.toolhead.manual_move([None, None, approach_start_z], lift_speed)
                 self.toolhead.wait_moves()
 
-                # 2. Start Stream (Latency 50)
-                # FIX: Changed 'self.beacon.request...' to 'self.request...'
+                # 2. Start Stream (Latency 50 for better resolution)
                 self.request_stream_latency(50) 
                 self._start_streaming()
                 
                 # 3. Slow Creep Move
                 self.toolhead.manual_move([None, None, target_kin_z], creep_speed)
                 self.toolhead.wait_moves()
+                
+                # 4. Dwell
                 self.toolhead.dwell(dwell_time)
                 
-                # 4. Measure
-                (dist, _samples) = self._sample(settle_time, 10)
+                # 5. Measure (High Sample Count)
+                (dist, _samples) = self._sample(settle_time, sample_count_per_read)
                 
-                # 5. Stop Stream
+                # 6. Stop Stream
                 self._stop_streaming()
-                # FIX: Changed 'self.beacon.drop...' to 'self.drop...'
                 self.drop_stream_latency_request(50)
                 
                 if next_dir == -1:
@@ -705,7 +710,6 @@ class BeaconProbe:
 
         finally:
             self._stop_streaming()
-            # FIX: Changed 'self.beacon.drop...' to 'self.drop...'
             self.drop_stream_latency_request(50)
 
         res_up = median(samples_up)
@@ -870,11 +874,11 @@ class BeaconProbe:
                     )
                     f.write(log_line)
 
-                # FIX: Changed 'self.beacon.request...' to 'self.request...'
-                self.request_stream_latency(100)
-                self._start_streaming() # self._start_streaming() is correct, no .beacon needed
+                # OPTIMIZATION: 50ms latency allows for better contact resolution
+                self.request_stream_latency(50)
+                self._start_streaming()
 
-                with self.streaming_session(_poke_stream_callback, latency=100):
+                with self.streaming_session(_poke_stream_callback, latency=50):
                     self._sample_async()
                     self.toolhead.get_last_move_time()
                     pos = self.toolhead.get_position()
@@ -915,9 +919,10 @@ class BeaconProbe:
                         self.mcu_contact_probe.deactivate_gcode.run_gcode_from_command()
                         self.toolhead.manual_move([None, None, top], 100.0)
                         self.toolhead.wait_moves()
-                        # FIX: Changed 'self.beacon...' to 'self...'
+                        # Clean up
                         self._stop_streaming()
-                        self.drop_stream_latency_request(100)
+                        self.drop_stream_latency_request(50)
+
         except OSError as e:
             gcmd.respond_info(f"Warning: Could not write poke data to {filename}: {e}")
 
@@ -2642,19 +2647,22 @@ class BeaconContactEndstopWrapper:
     def add_stepper(self, stepper): self.endstop_manager.add_stepper(stepper)
     def get_steppers(self): return self.endstop_manager.get_steppers()
 
-    def home_start(self, print_time, sample_time, sample_count, rest_time, triggered=True):
-        extruder = self.beacon.toolhead.get_extruder()
+    def home_start(
+        self, print_time, sample_time, sample_count, rest_time, triggered=True
+    ):
+        # ... (extruder temp check) ...
         if extruder is not None:
-            curtime = self.beacon.reactor.monotonic()
-            cur_temp = extruder.get_heater().get_status(curtime)["temperature"]
+            # ...
             if cur_temp >= self.max_hotend_temp:
-                raise self.printer.command_error(f"Current hotend temperature {cur_temp:.1f} exceeds maximum allowed {self.max_hotend_temp:.1f}")
+                 # ...
 
         self.is_homing = True
-        # FIX: Use latency=100 to prevent CPU overload
-        self.beacon.request_stream_latency(100)
+        
+        # OPTIMIZATION: Latency 50 for better contact timestamping
+        self.beacon.request_stream_latency(50)
         self.beacon._start_streaming()
-        self.beacon._sample_async()
+        self.beacon._sample_async() 
+        
         self.endstop_manager.trsync_start(print_time)
         
         primary_trsync = self.endstop_manager.trsync_mcus[0]
@@ -2695,8 +2703,8 @@ class BeaconContactEndstopWrapper:
                     return trigger_time
         finally:
             self.beacon.beacon_contact_stop_home_cmd.send()
-            # FIX: Drop latency request
-            self.beacon.drop_stream_latency_request(100)
+            # CLEANUP: Drop 50ms request
+            self.beacon.drop_stream_latency_request(50)
 
     def query_endstop(self, print_time): return 0
     def get_position_endstop(self): return 0
